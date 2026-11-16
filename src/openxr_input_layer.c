@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "Quaternion.h"
+#include "xr_core.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -88,22 +89,7 @@ static uint32_t right_pose_correction_log_counter;
 
 static float apply_negative_trigger_sensitivity(float original, float threshold)
 {
-  float gain;
-  float adjusted;
-  if (threshold >= 0.0f)
-  {
-	if (original < threshold)
-	  return 0.0f;
-	return original;
-  }
-
-  gain = 1.0f + (-threshold);
-  adjusted = original * gain;
-  if (adjusted > 1.0f)
-	adjusted = 1.0f;
-  if (adjusted < 0.0f)
-	adjusted = 0.0f;
-  return adjusted;
+  return core_trigger_sensitivity(original, threshold);
 }
 
 static const char *action_name(XrAction action)
@@ -458,51 +444,22 @@ static void add_right_action_space(XrSpace space)
 
 static void apply_right_pose_correction(XrSpaceLocation *location)
 {
-	Quaternion hand;
-  Quaternion original_hand;
-  Quaternion rotation;
-  float rotation_zyx[3];
-  float offset[3];
-  float rotated[3];
+  double rot[3];
+  double pos[3];
 
-	if ((location->locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0 ||
+  if ((location->locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0 ||
 	  (location->locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) == 0)
   {
 	return;
   }
 
-	hand.v[Z_AXIS] = location->pose.orientation.z;
-  hand.v[Y_AXIS] = location->pose.orientation.y;
-  hand.v[X_AXIS] = location->pose.orientation.x;
-  hand.w = location->pose.orientation.w;
-  Quaternion_copy(&hand, &original_hand);
-
-  rotation_zyx[Z_AXIS] = config.offset_rotation_right_z;
-  rotation_zyx[Y_AXIS] = config.offset_rotation_right_y;
-  rotation_zyx[X_AXIS] = config.offset_rotation_right_x;
-  Quaternion_fromEulerZYX(rotation_zyx, &rotation);
-
-  if (config.right_hand_frame_local)
-	Quaternion_multiply(&hand, &rotation, &hand);
-  else
-	Quaternion_multiply(&rotation, &hand, &hand);
-
-  offset[0] = config.offset_position_right_x;
-  offset[1] = config.offset_position_right_y;
-  offset[2] = config.offset_position_right_z;
-
-  if (config.right_hand_frame_local)
-	Quaternion_rotate(&original_hand, offset, rotated);
-  else
-	Quaternion_rotate(&rotation, offset, rotated);
-
-  location->pose.position.x += rotated[0];
-  location->pose.position.y += rotated[1];
-  location->pose.position.z += rotated[2];
-	location->pose.orientation.z = hand.v[Z_AXIS];
-  location->pose.orientation.y = hand.v[Y_AXIS];
-  location->pose.orientation.x = hand.v[X_AXIS];
-  location->pose.orientation.w = hand.w;
+  rot[0] = config.offset_rotation_right_x;
+  rot[1] = config.offset_rotation_right_y;
+  rot[2] = config.offset_rotation_right_z;
+  pos[0] = config.offset_position_right_x;
+  pos[1] = config.offset_position_right_y;
+  pos[2] = config.offset_position_right_z;
+  core_apply_right_offset(&location->pose, rot, pos, config.right_hand_frame_local);
 }
 
 static XrResult XRAPI_CALL layer_create_action(

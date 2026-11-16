@@ -6,7 +6,7 @@ TARGET_RELEASE = $(OBJDIR_RELEASE)/$(TARGET_NAME)
 BASE_SPACE_DEBUG_OBJDIR := obj/BaseSpaceDebug
 BASE_SPACE_DEBUG_TARGET := $(BASE_SPACE_DEBUG_OBJDIR)/openxr_loader_base_space_debug.dll
 
-SRC := src/gui.c src/main.c src/Quaternion.c
+SRC := src/gui.c src/main.c src/Quaternion.c src/xr_core.c
 DEF_FILE := src/openxr_loader.def
 
 OBJDIR_DEBUG := obj/Debug
@@ -59,7 +59,7 @@ LAYER_DEMO_CFLAGS := $(COMMON_FLAGS) -O0 -g3
 
 INPUT_LAYER_CFLAGS := $(COMMON_FLAGS) -O0 -g3
 
-INPUT_LAYER_SRC := src/openxr_input_layer.c src/Quaternion.c
+INPUT_LAYER_SRC := src/openxr_input_layer.c src/Quaternion.c src/xr_core.c
 INPUT_LAYER_OBJDIR := obj/InputLayer
 INPUT_LAYER_OBJ := $(INPUT_LAYER_SRC:%.c=$(INPUT_LAYER_OBJDIR)/%.o)
 INPUT_LAYER_TARGET := $(INPUT_LAYER_OBJDIR)/openxr_input_layer.dll

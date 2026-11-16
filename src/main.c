@@ -64,6 +64,7 @@
 
 #include "main.h"
 #include "gui.h"
+#include "xr_core.h"
 
 // uses https://github.com/MartinWeigel/Quaternion for quaternions because i suck at math
 #include "Quaternion.h"
@@ -213,20 +214,7 @@ static int right_action_space_kind(XrSpace space)
 
 static float apply_trigger_sensitivity(float original)
 {
-  if (trigger_press_threshold >= 0.0)
-  {
-    return original < (float)trigger_press_threshold ? 0.0f : original;
-  }
-
-  {
-    float gain = 1.0f + (float)(-trigger_press_threshold);
-    float adjusted = original * gain;
-    if (adjusted > 1.0f)
-      adjusted = 1.0f;
-    if (adjusted < 0.0f)
-      adjusted = 0.0f;
-    return adjusted;
-  }
+  return core_trigger_sensitivity(original, (float)trigger_press_threshold);
 }
 
 static void update_pose_display_snapshot(int left, XrSpace base_space, const XrPosef *controller_pose)
@@ -2047,8 +2035,16 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetCurrentInteractionProfile(
     XrPath topLevelUserPath,
     XrInteractionProfileState *interactionProfile)
 {
-  log_message("xrGetCurrentInteractionProfile %d", rand() % 1000);
-  return _xrGetCurrentInteractionProfile(session, topLevelUserPath, interactionProfile);
+  XrResult ret = _xrGetCurrentInteractionProfile(session, topLevelUserPath, interactionProfile);
+  if (ret == XR_SUCCESS && interactionProfile && diag_instance != XR_NULL_HANDLE)
+  {
+    char top[XR_MAX_PATH_LENGTH];
+    char profile[XR_MAX_PATH_LENGTH];
+    binding_path_to_string(diag_instance, topLevelUserPath, top, sizeof(top));
+    binding_path_to_string(diag_instance, interactionProfile->interactionProfile, profile, sizeof(profile));
+    log_message("PROFILE_DIAG user_path=%s interaction_profile=%s", top, profile);
+  }
+  return ret;
 }
 
 // xrGetInputSourceLocalizedName

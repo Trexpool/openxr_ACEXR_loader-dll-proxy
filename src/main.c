@@ -190,7 +190,7 @@ volatile LONG pose_capture_right = 0;
 #define ACTION_SPACE_LIST_CAPACITY 64
 
 int log_message(const char *fmt, ...);
-
+static XrInstance diag_instance = XR_NULL_HANDLE;
 static Quaternion quaternion_from_xr(const XrQuaternionf *orientation)
 {
   Quaternion result;
@@ -1742,7 +1742,12 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCreateInstance(
   */
 
   log_message("xrCreateInstance %d", rand() % 1000);
-  return _xrCreateInstance(createInfo, instance);
+  {
+    XrResult created = _xrCreateInstance(createInfo, instance);
+    if (created == XR_SUCCESS && instance)
+      diag_instance = *instance;
+    return created;
+  }
 }
 
 // xrCreateReferenceSpace

@@ -1,0 +1,10 @@
+{
+  "file_format_version": "1.0.0",
+  "api_layer": {
+    "name": "XR_APILAYER_OSSO_openxr_input_layer",
+    "library_path": "obj\\InputLayer\\openxr_input_layer.dll",
+    "api_version": "1.0",
+    "implementation_version": "1",
+    "description": "OpenXR input and pose interception layer"
+  }
+}

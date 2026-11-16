@@ -1,0 +1,4 @@
+EXPORTS
+	xrGetInstanceProcAddr
+	xrCreateApiLayerInstance
+	xrNegotiateLoaderApiLayerInterface

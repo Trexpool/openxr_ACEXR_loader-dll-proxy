@@ -284,6 +284,21 @@ static void update_pose_display_snapshot(int left, XrSpace base_space, const XrP
   float relative_rotation[3];
   Quaternion_toEulerZYX(&relative_orientation, relative_rotation);
 
+  {
+    Quaternion implied;
+    Quaternion_conjugate(&relative_orientation, &implied);
+    log_message("CAPTURE_DIAG space=%llu kind=%d head_xyzw=%.6f,%.6f,%.6f,%.6f controller_xyzw=%.6f,%.6f,%.6f,%.6f "
+                "relative_xyzw=%.6f,%.6f,%.6f,%.6f implied_offset_xyzw=%.6f,%.6f,%.6f,%.6f",
+                (unsigned long long)latest_head_base_space, left ? -1 : 0,
+                latest_head_pose.orientation.x, latest_head_pose.orientation.y,
+                latest_head_pose.orientation.z, latest_head_pose.orientation.w,
+                controller_pose->orientation.x, controller_pose->orientation.y,
+                controller_pose->orientation.z, controller_pose->orientation.w,
+                relative_orientation.v[X_AXIS], relative_orientation.v[Y_AXIS],
+                relative_orientation.v[Z_AXIS], relative_orientation.w,
+                implied.v[X_AXIS], implied.v[Y_AXIS], implied.v[Z_AXIS], implied.w);
+  }
+
   snapshot->rotation_x = radToDeg(relative_rotation[X_AXIS]);
   snapshot->rotation_y = radToDeg(relative_rotation[Y_AXIS]);
   snapshot->rotation_z = radToDeg(relative_rotation[Z_AXIS]);

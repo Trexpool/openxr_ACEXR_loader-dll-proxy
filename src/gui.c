@@ -594,8 +594,8 @@ LRESULT CALLBACK WindowProcedure_setup_job(HWND hwnd, UINT message, WPARAM wPara
 
   // fazer algo qd o user apertar o bot�o de fechar
   case WM_CLOSE:
-    // flag_quit = 1;
-    return 1;
+    DestroyWindow(hwnd); /* WM_DESTROY posts WM_QUIT, which ends the GUI thread loop */
+    return 0;
 
   default: /* for messages that we don't deal with */
     return DefWindowProc(hwnd, message, wParam, lParam);

@@ -1,5 +1,6 @@
 
 #include "gui.h"
+#include "xr_core.h"
 #include <ctype.h>
 #include <math.h>
 
@@ -155,7 +156,15 @@ enum
   ID_LABEL_POSE_STATUS,
   ID_LABEL_TRIGGER_THRESHOLD,
   ID_BTN_TRIGGER_THRESHOLD_DOWN,
-  ID_BTN_TRIGGER_THRESHOLD_UP
+  ID_BTN_TRIGGER_THRESHOLD_UP,
+  ID_LABEL_TRIGGER_EXPONENT,
+  ID_BTN_TRIGGER_EXPONENT_DOWN,
+  ID_BTN_TRIGGER_EXPONENT_UP,
+  ID_LABEL_TRIGGER_DEADZONE,
+  ID_BTN_TRIGGER_DEADZONE_DOWN,
+  ID_BTN_TRIGGER_DEADZONE_UP,
+  ID_BTN_TRIGGER_RESET,
+  ID_LABEL_TRIGGER_PREVIEW
 };
 
 static HANDLE add_readonly(int x, int y, int tx, int ty, char *text, int id);
@@ -168,6 +177,9 @@ HANDLE HWND_POSE_STATUS;
 HANDLE HWND_FRAME_BUTTON;
 HANDLE HWND_CAPTURE_MODE_BUTTON;
 HANDLE HWND_TRIGGER_THRESHOLD;
+HANDLE HWND_TRIGGER_EXPONENT;
+HANDLE HWND_TRIGGER_DEADZONE;
+HANDLE HWND_TRIGGER_PREVIEW;
 
 static void update_trigger_threshold_display(void);
 
@@ -214,8 +226,8 @@ LRESULT CALLBACK WindowProcedure_setup_job(HWND hwnd, UINT message, WPARAM wPara
 
     case offset_dialog_constats + ID_BTN_TRIGGER_THRESHOLD_DOWN:
       trigger_press_threshold -= 0.01;
-      if (trigger_press_threshold < -3.0)
-        trigger_press_threshold = -3.0;
+      if (trigger_press_threshold < 0.0)
+        trigger_press_threshold = 0.0;
       write_config(config_file_path);
       update_trigger_threshold_display();
       return 1;
@@ -224,6 +236,47 @@ LRESULT CALLBACK WindowProcedure_setup_job(HWND hwnd, UINT message, WPARAM wPara
       trigger_press_threshold += 0.01;
       if (trigger_press_threshold > 1.0)
         trigger_press_threshold = 1.0;
+      write_config(config_file_path);
+      update_trigger_threshold_display();
+      return 1;
+
+    case offset_dialog_constats + ID_BTN_TRIGGER_EXPONENT_DOWN:
+      trigger_curve_exponent -= 0.05;
+      if (trigger_curve_exponent < 0.05)
+        trigger_curve_exponent = 0.05;
+      write_config(config_file_path);
+      update_trigger_threshold_display();
+      return 1;
+
+    case offset_dialog_constats + ID_BTN_TRIGGER_EXPONENT_UP:
+      trigger_curve_exponent += 0.05;
+      if (trigger_curve_exponent > 20.0)
+        trigger_curve_exponent = 20.0;
+      write_config(config_file_path);
+      update_trigger_threshold_display();
+      return 1;
+
+    case offset_dialog_constats + ID_BTN_TRIGGER_DEADZONE_DOWN:
+      trigger_deadzone -= 0.01;
+      if (trigger_deadzone < 0.0)
+        trigger_deadzone = 0.0;
+      write_config(config_file_path);
+      update_trigger_threshold_display();
+      return 1;
+
+    case offset_dialog_constats + ID_BTN_TRIGGER_DEADZONE_UP:
+      trigger_deadzone += 0.01;
+      if (trigger_deadzone > 0.9)
+        trigger_deadzone = 0.9;
+      write_config(config_file_path);
+      update_trigger_threshold_display();
+      return 1;
+
+    case offset_dialog_constats + ID_BTN_TRIGGER_RESET:
+      trigger_press_threshold = 0.5;
+      trigger_deadzone = 0.0;
+      trigger_curve_exponent = 1.0;
+      trigger_gain = 1.0;
       write_config(config_file_path);
       update_trigger_threshold_display();
       return 1;
@@ -719,9 +772,25 @@ static void update_pose_display(void)
 
 static void update_trigger_threshold_display(void)
 {
-  char text[32];
+  char text[160];
+  CoreTriggerCfg cfg;
   snprintf(text, sizeof(text), "%1.1f", trigger_press_threshold * 100.0);
   SetWindowTextA((HWND)HWND_TRIGGER_THRESHOLD, text);
+  snprintf(text, sizeof(text), "%1.2f", trigger_curve_exponent);
+  SetWindowTextA((HWND)HWND_TRIGGER_EXPONENT, text);
+  snprintf(text, sizeof(text), "%1.1f", trigger_deadzone * 100.0);
+  SetWindowTextA((HWND)HWND_TRIGGER_DEADZONE, text);
+
+  core_trigger_cfg_defaults(&cfg);
+  cfg.deadzone = (float)trigger_deadzone;
+  cfg.exponent = (float)trigger_curve_exponent;
+  cfg.press_threshold = (float)trigger_press_threshold;
+  cfg.gain = (float)trigger_gain;
+  core_trigger_cfg_sanitize(&cfg);
+  snprintf(text, sizeof(text), "Preview raw->out: 25%%=%.0f%%  50%%=%.0f%%  75%%=%.0f%%  (press at curved >= %.0f%%)",
+           core_trigger_output(0.25f, &cfg) * 100.0, core_trigger_output(0.5f, &cfg) * 100.0,
+           core_trigger_output(0.75f, &cfg) * 100.0, trigger_press_threshold * 100.0);
+  SetWindowTextA((HWND)HWND_TRIGGER_PREVIEW, text);
 }
 
 LRESULT CALLBACK repeat_button_proc(HWND button, UINT message, WPARAM wParam, LPARAM lParam)
@@ -959,7 +1028,7 @@ void create_gui()
       CW_USEDEFAULT,                            /* Windows decides the position */
       CW_USEDEFAULT,                            /* where the window ends up on the screen */
       820,                                      /* The programs width */
-       680,                                      /* and height in pixels */
+       700,                                      /* and height in pixels */
       HWND_DESKTOP,                             /* The window is a child-window to desktop */
       NULL,                                     /* No menu */
       hInstance,                                /* Program Instance handler */
@@ -1185,10 +1254,26 @@ void create_gui()
                                                ID_BTN_CAPTURE_MODE);
   HWND_POSE_STATUS = add_label(450, 515, 240, 30, "Ready.", ID_LABEL_POSE_STATUS);
   add_label(10, 550, 185, 20, "Trigger threshold [%]:", 0);
+  add_label(520, 530, 290, 40, "Boolean press threshold (0-1). Some games fire from the analog axis instead; for those, use trigger_deadzone and trigger_curve_exponent.", 0);
   snprintf(stlabel, sizeof(stlabel), "%1.1f", trigger_press_threshold * 100.0);
   HWND_TRIGGER_THRESHOLD = add_readonly(200, 550, 60, 20, stlabel, ID_LABEL_TRIGGER_THRESHOLD);
   add_button(265, 550, 55, 24, "-1%", ID_BTN_TRIGGER_THRESHOLD_DOWN);
   add_button(325, 550, 55, 24, "+1%", ID_BTN_TRIGGER_THRESHOLD_UP);
+  add_button(390, 550, 120, 24, "Reset trigger", ID_BTN_TRIGGER_RESET);
+
+  add_label(10, 580, 330, 20, "Trigger curve (exponent): 1.0 = linear, >1 = easier pull, <1 = deeper pull", 0);
+  snprintf(stlabel, sizeof(stlabel), "%1.2f", trigger_curve_exponent);
+  HWND_TRIGGER_EXPONENT = add_readonly(345, 580, 60, 20, stlabel, ID_LABEL_TRIGGER_EXPONENT);
+  add_button(410, 580, 55, 24, "-0.05", ID_BTN_TRIGGER_EXPONENT_DOWN);
+  add_button(470, 580, 55, 24, "+0.05", ID_BTN_TRIGGER_EXPONENT_UP);
+
+  add_label(10, 610, 185, 20, "Trigger deadzone [%]:", 0);
+  snprintf(stlabel, sizeof(stlabel), "%1.1f", trigger_deadzone * 100.0);
+  HWND_TRIGGER_DEADZONE = add_readonly(200, 610, 60, 20, stlabel, ID_LABEL_TRIGGER_DEADZONE);
+  add_button(265, 610, 55, 24, "-1%", ID_BTN_TRIGGER_DEADZONE_DOWN);
+  add_button(325, 610, 55, 24, "+1%", ID_BTN_TRIGGER_DEADZONE_UP);
+  HWND_TRIGGER_PREVIEW = add_label(390, 612, 420, 20, "", ID_LABEL_TRIGGER_PREVIEW);
+  update_trigger_threshold_display();
 
   // tamanho ajuste
 

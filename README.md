@@ -33,3 +33,10 @@ ideas that i desire to explore in the future:
 the precompiled binaries were made using msys2 mingw64-ucrt, but is likely that other compilers will work as well.
 
 the makefile has a target named "dll_release" that produces the desired, required dll file for the proxy.
+## Trigger settings
+
+- `trigger_press_threshold` is a Boolean press threshold (0-1). Some games fire from the analog axis instead; for those, use `trigger_deadzone` and `trigger_curve_exponent`.
+- A threshold of 0.0 makes the Boolean read as permanently pressed (curved value >= 0 is always true).
+- `trigger_gain` affects only the analog value, which is always clamped to [0,1] after gain.
+- Below `trigger_deadzone` the analog output is exactly 0.0.
+

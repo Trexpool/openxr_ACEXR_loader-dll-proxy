@@ -58,6 +58,11 @@ extern double trigger_press_threshold;
 extern double trigger_deadzone;
 extern double trigger_curve_exponent;
 extern double trigger_gain;
+extern double trigger_force_value;
+extern double trigger_click_threshold;
+extern double trigger_range_max;
+extern char trigger_target_action[128];
+extern volatile long action_dump_requested;
 
 extern char config_file_path[256];
 

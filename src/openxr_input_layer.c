@@ -73,6 +73,9 @@ static PFN_xrCreateAction next_create_action;
 static PFN_xrCreateActionSpace next_create_action_space;
 static PFN_xrStringToPath next_string_to_path;
 static PFN_xrPathToString next_path_to_string;
+static PFN_xrEnumerateBoundSourcesForAction next_enumerate_sources;
+static PFN_xrAttachSessionActionSets next_attach_action_sets;
+static XrInstance layer_instance;
 
 static ActionMetadata actions[ACTION_CAPACITY];
 static uint32_t action_count;
@@ -96,12 +99,7 @@ static float apply_negative_trigger_sensitivity(float original, float threshold)
 
 static const char *action_name(XrAction action)
 {
-  for (uint32_t i = 0; i < action_count; ++i)
-  {
-	if (actions[i].handle == action)
-	  return actions[i].name;
-  }
-  return "<unknown>";
+  return core_action_name(action);
 }
 
 static XrAction action_handle_for_name(const char *name)
@@ -358,6 +356,34 @@ static void load_layer_config(void)
 	  continue;
 	}
 
+	if (strcmp(command, "trigger_force_value") == 0 && sscanf(value, "%lf", &number) == 1)
+	{
+	  config.trigger.force_value = (float)number;
+	  core_trigger_cfg_sanitize(&config.trigger);
+	  continue;
+	}
+
+	if (strcmp(command, "trigger_click_threshold") == 0 && sscanf(value, "%lf", &number) == 1)
+	{
+	  config.trigger.click_threshold = (float)number;
+	  core_trigger_cfg_sanitize(&config.trigger);
+	  continue;
+	}
+
+	if (strcmp(command, "trigger_range_max") == 0 && sscanf(value, "%lf", &number) == 1)
+	{
+	  if (number > 0.0)
+		config.trigger.range_max = (float)number;
+	  core_trigger_cfg_sanitize(&config.trigger);
+	  continue;
+	}
+
+	if (strcmp(command, "trigger_target_action") == 0)
+	{
+	  core_trigger_set_target(value);
+	  continue;
+	}
+
 	if (strcmp(command, "trigger_gain") == 0 && sscanf(value, "%lf", &number) == 1)
 	{
 	  config.trigger.gain = (float)number;
@@ -517,7 +543,7 @@ static XrResult XRAPI_CALL layer_create_action(
 	}
 
 	actions[action_count].has_right_subaction = has_right;
-	core_trigger_note_action(*action, createInfo->actionType);
+	core_trigger_note_action(*action, createInfo->actionType, createInfo->actionName);
 	++action_count;
   }
   return result;
@@ -771,13 +797,84 @@ static int layer_trigger_match(XrAction action, XrPath sub, int want_bool, const
   return 1;
 }
 
+static void layer_dump_action_table(const char *why)
+{
+  char line[2048];
+  char head[96];
+  snprintf(head, sizeof(head), "ACTION_TABLE dump reason=%s count=%d", why, core_action_table_count());
+  layer_log(head);
+  for (int i = 0; i < core_action_table_count(); ++i)
+	if (core_action_table_format(i, line, sizeof(line)))
+	  layer_log(line);
+}
+
+static void layer_note_query(XrAction action, int modified, const char *kind)
+{
+  char message[768];
+  int r = core_query_note(action, modified);
+  if (r & CORE_QUERY_FIRST_CLICK)
+  {
+	snprintf(message, sizeof(message),
+			 "*** GAME QUERIES TRIGGER CLICK ACTION: action=\"%s\" source=%s (%s) modified=%d ***",
+			 action_name(action), core_click_source_path(action), kind, modified);
+	layer_log(message);
+  }
+  if (r & CORE_QUERY_FIRST_UNMODIFIED)
+  {
+	snprintf(message, sizeof(message),
+			 "*** GAME QUERIES TRIGGER-BOUND ACTION THE PROXY IS NOT MODIFYING: action=\"%s\" value_source=%s click_source=%s (%s) ***",
+			 action_name(action), core_trigger_source_path(action), core_click_source_path(action), kind);
+	layer_log(message);
+  }
+}
+
+static void layer_exit_summary(void)
+{
+  char line[256];
+  core_trigger_summary(line, sizeof(line));
+  layer_log(line);
+}
+
+static XrResult XRAPI_CALL layer_enumerate_sources(
+	XrSession session, const XrBoundSourcesForActionEnumerateInfo *info,
+	uint32_t capacity, uint32_t *count, XrPath *sources)
+{
+  XrResult result = next_enumerate_sources(session, info, capacity, count, sources);
+  if (result == XR_SUCCESS && info && sources && count)
+  {
+	for (uint32_t i = 0; i < *count && i < capacity; ++i)
+	{
+	  char path[XR_MAX_PATH_LENGTH];
+	  binding_path_to_string(layer_instance, sources[i], path, sizeof(path));
+	  core_trigger_mark_source(info->action, path);
+	}
+  }
+  return result;
+}
+
+static XrResult XRAPI_CALL layer_attach_action_sets(
+	XrSession session, const XrSessionActionSetsAttachInfo *info)
+{
+  XrResult result = next_attach_action_sets(session, info);
+  layer_dump_action_table("startup");
+  return result;
+}
+
+static int layer_click_match(XrAction action, XrPath sub)
+{
+  int flags = core_trigger_click_flags(action);
+  if (!(flags & CORE_HAND_RIGHT))
+	return 0;
+  return sub == right_hand_path || (sub == XR_NULL_PATH && flags == CORE_HAND_RIGHT);
+}
+
 static void layer_trigger_diag(const char *method, XrAction action, float raw)
 {
   float curved = core_trigger_curve(raw, &config.trigger);
   int pressed = core_trigger_pressed(raw, &config.trigger);
   if (core_trigger_log_gate(raw, curved, pressed, (unsigned long long)GetTickCount64()))
   {
-	char line[512];
+	char line[768];
 	core_trigger_format_diag(line, sizeof(line), method, action_name(action), action, "right", raw,
 							 curved, core_trigger_output(raw, &config.trigger), pressed,
 							 &config.trigger);
@@ -793,12 +890,14 @@ static XrResult XRAPI_CALL layer_get_action_state_boolean(
   XrResult result = next_get_action_state_boolean(session, getInfo, state);
   XrBool32 original_state = state ? state->currentState : XR_FALSE;
   const char *method = "";
+  int modified = 0;
 
   load_layer_config();
   if (getInfo && state)
   {
 	if (result == XR_SUCCESS &&
-		layer_trigger_match(getInfo->action, getInfo->subactionPath, 1, &method))
+		layer_trigger_match(getInfo->action, getInfo->subactionPath, 1, &method) &&
+		!core_trigger_target_excludes(getInfo->action))
 	{
 	  XrAction trigger_action = core_trigger_sources_known()
 									? core_trigger_find_float_action(CORE_HAND_RIGHT)
@@ -823,16 +922,45 @@ static XrResult XRAPI_CALL layer_get_action_state_boolean(
 		  state->changedSinceLastSync = trigger_state.changedSinceLastSync;
 		  state->lastChangeTime = trigger_state.lastChangeTime;
 		  layer_trigger_diag(method, trigger_action, trigger_state.currentState);
+		  modified = 1;
+		}
+	  }
+	}
+	else if (result == XR_SUCCESS && layer_click_match(getInfo->action, getInfo->subactionPath) &&
+			 core_trigger_click_enabled(&config.trigger))
+	{
+	  XrAction trigger_action = core_trigger_find_float_action(CORE_HAND_RIGHT);
+	  XrActionStateGetInfo trigger_info = {XR_TYPE_ACTION_STATE_GET_INFO};
+	  XrActionStateFloat trigger_state = {XR_TYPE_ACTION_STATE_FLOAT};
+	  if (trigger_action != XR_NULL_HANDLE)
+	  {
+		trigger_info.action = trigger_action;
+		trigger_info.subactionPath = getInfo->subactionPath;
+		if (next_get_action_state_float(session, &trigger_info, &trigger_state) == XR_SUCCESS &&
+			trigger_state.isActive)
+		{
+		  char message[768];
+		  float raw = trigger_state.currentState;
+		  int out = core_trigger_click(raw, &config.trigger);
+		  state->currentState = out;
+		  modified = 1;
+		  snprintf(message, sizeof(message),
+				   "CLICK_DIAG method=source_path action=\"%s\" source=%s runtime=%d out=%d curved=%.6f threshold=%.6f",
+				   action_name(getInfo->action), core_click_source_path(getInfo->action),
+				   (int)original_state, out, core_trigger_curve(raw, &config.trigger),
+				   config.trigger.click_threshold);
+		  layer_log(message);
 		}
 	  }
 	}
 
+	layer_note_query(getInfo->action, modified, "boolean");
 	{
 	  char message[512];
 	  snprintf(message, sizeof(message),
-			   "xrGetActionStateBoolean action=%s active=%d original=%d value=%d threshold=%.3f result=%d",
+			   "xrGetActionStateBoolean action=%s active=%d runtime=%d out=%d modified=%d result=%d",
 			   action_name(getInfo->action), state->isActive, original_state, state->currentState,
-			   config.trigger_press_threshold, result);
+			   modified, result);
 	  layer_log(message);
 	}
   }
@@ -847,12 +975,14 @@ static XrResult XRAPI_CALL layer_get_action_state_float(
   XrResult result = next_get_action_state_float(session, getInfo, state);
   float original_state = state ? state->currentState : 0.0f;
   const char *method = "";
+  int modified = 0;
 
   load_layer_config();
   if (getInfo && state)
   {
 	if (result == XR_SUCCESS && state->isActive &&
-		layer_trigger_match(getInfo->action, getInfo->subactionPath, 0, &method))
+		layer_trigger_match(getInfo->action, getInfo->subactionPath, 0, &method) &&
+		!core_trigger_target_excludes(getInfo->action))
 	{
 	  float raw = state->currentState;
 	  if (core_trigger_method_first_use(strcmp(method, "source_path") == 0))
@@ -864,14 +994,16 @@ static XrResult XRAPI_CALL layer_get_action_state_float(
 	  state->currentState = core_trigger_output(raw, &config.trigger);
 	  core_trigger_track(raw, state->currentState);
 	  layer_trigger_diag(method, getInfo->action, raw);
+	  modified = 1;
 	}
 
+	layer_note_query(getInfo->action, modified, "float");
 	{
 	  char message[512];
 	  snprintf(message, sizeof(message),
-			   "xrGetActionStateFloat action=%s active=%d original=%f value=%f threshold=%.3f result=%d",
+			   "xrGetActionStateFloat action=%s active=%d runtime=%.6f out=%.6f modified=%d result=%d",
 			   action_name(getInfo->action), state->isActive, original_state, state->currentState,
-			   config.trigger_press_threshold, result);
+			   modified, result);
 	  layer_log(message);
 	}
   }
@@ -964,6 +1096,16 @@ LAYER_EXPORT XRAPI_ATTR XrResult XRAPI_CALL xrGetInstanceProcAddr(
 	*function = (PFN_xrVoidFunction)layer_locate_space;
 	return XR_SUCCESS;
   }
+  if (strcmp(name, "xrEnumerateBoundSourcesForAction") == 0 && next_enumerate_sources)
+  {
+	*function = (PFN_xrVoidFunction)layer_enumerate_sources;
+	return XR_SUCCESS;
+  }
+  if (strcmp(name, "xrAttachSessionActionSets") == 0 && next_attach_action_sets)
+  {
+	*function = (PFN_xrVoidFunction)layer_attach_action_sets;
+	return XR_SUCCESS;
+  }
   if (!next_get_instance_proc_addr)
 	return XR_ERROR_INITIALIZATION_FAILED;
   return next_get_instance_proc_addr(instance, name, function);
@@ -1036,6 +1178,15 @@ LAYER_EXPORT XRAPI_ATTR XrResult XRAPI_CALL xrCreateApiLayerInstance(
   if (next_get_instance_proc_addr(*instance, "xrPathToString", &function) != XR_SUCCESS)
 	return XR_ERROR_INITIALIZATION_FAILED;
   next_path_to_string = (PFN_xrPathToString)function;
+
+  layer_instance = *instance;
+  next_enumerate_sources = NULL;
+  next_attach_action_sets = NULL;
+  if (next_get_instance_proc_addr(*instance, "xrEnumerateBoundSourcesForAction", &function) == XR_SUCCESS)
+    next_enumerate_sources = (PFN_xrEnumerateBoundSourcesForAction)function;
+  if (next_get_instance_proc_addr(*instance, "xrAttachSessionActionSets", &function) == XR_SUCCESS)
+    next_attach_action_sets = (PFN_xrAttachSessionActionSets)function;
+  atexit(layer_exit_summary);
 
   if (next_string_to_path(*instance, "/user/hand/right", &right_hand_path) != XR_SUCCESS)
 	right_hand_path = XR_NULL_PATH;

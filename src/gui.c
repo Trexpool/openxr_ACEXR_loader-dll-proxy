@@ -164,7 +164,12 @@ enum
   ID_BTN_TRIGGER_DEADZONE_DOWN,
   ID_BTN_TRIGGER_DEADZONE_UP,
   ID_BTN_TRIGGER_RESET,
-  ID_LABEL_TRIGGER_PREVIEW
+  ID_LABEL_TRIGGER_PREVIEW,
+  ID_LABEL_CLICK,
+  ID_BTN_CLICK_DOWN,
+  ID_BTN_CLICK_UP,
+  ID_BTN_CLICK_OFF,
+  ID_BTN_DUMP_ACTIONS
 };
 
 static HANDLE add_readonly(int x, int y, int tx, int ty, char *text, int id);
@@ -180,6 +185,7 @@ HANDLE HWND_TRIGGER_THRESHOLD;
 HANDLE HWND_TRIGGER_EXPONENT;
 HANDLE HWND_TRIGGER_DEADZONE;
 HANDLE HWND_TRIGGER_PREVIEW;
+HANDLE HWND_CLICK_VALUE;
 
 static void update_trigger_threshold_display(void);
 
@@ -272,7 +278,36 @@ LRESULT CALLBACK WindowProcedure_setup_job(HWND hwnd, UINT message, WPARAM wPara
       update_trigger_threshold_display();
       return 1;
 
+    case offset_dialog_constats + ID_BTN_CLICK_DOWN:
+      trigger_click_threshold = (trigger_click_threshold < 0.0 ? 0.0 : trigger_click_threshold) - 0.01;
+      if (trigger_click_threshold < 0.0)
+        trigger_click_threshold = 0.0;
+      write_config(config_file_path);
+      update_trigger_threshold_display();
+      return 1;
+
+    case offset_dialog_constats + ID_BTN_CLICK_UP:
+      trigger_click_threshold = (trigger_click_threshold < 0.0 ? 0.0 : trigger_click_threshold) + 0.01;
+      if (trigger_click_threshold > 1.0)
+        trigger_click_threshold = 1.0;
+      write_config(config_file_path);
+      update_trigger_threshold_display();
+      return 1;
+
+    case offset_dialog_constats + ID_BTN_CLICK_OFF:
+      trigger_click_threshold = -1.0;
+      write_config(config_file_path);
+      update_trigger_threshold_display();
+      return 1;
+
+    case offset_dialog_constats + ID_BTN_DUMP_ACTIONS:
+      InterlockedExchange(&action_dump_requested, 1);
+      return 1;
+
     case offset_dialog_constats + ID_BTN_TRIGGER_RESET:
+      trigger_click_threshold = -1.0;
+      trigger_force_value = -1.0;
+      trigger_range_max = 1.0;
       trigger_press_threshold = 0.5;
       trigger_deadzone = 0.0;
       trigger_curve_exponent = 1.0;
@@ -780,6 +815,11 @@ static void update_trigger_threshold_display(void)
   SetWindowTextA((HWND)HWND_TRIGGER_EXPONENT, text);
   snprintf(text, sizeof(text), "%1.1f", trigger_deadzone * 100.0);
   SetWindowTextA((HWND)HWND_TRIGGER_DEADZONE, text);
+  if (trigger_click_threshold < 0.0)
+    snprintf(text, sizeof(text), "-1 (hardware)");
+  else
+    snprintf(text, sizeof(text), "%1.2f", trigger_click_threshold);
+  SetWindowTextA((HWND)HWND_CLICK_VALUE, text);
 
   core_trigger_cfg_defaults(&cfg);
   cfg.deadzone = (float)trigger_deadzone;
@@ -1028,7 +1068,7 @@ void create_gui()
       CW_USEDEFAULT,                            /* Windows decides the position */
       CW_USEDEFAULT,                            /* where the window ends up on the screen */
       820,                                      /* The programs width */
-       700,                                      /* and height in pixels */
+       760,                                      /* and height in pixels */
       HWND_DESKTOP,                             /* The window is a child-window to desktop */
       NULL,                                     /* No menu */
       hInstance,                                /* Program Instance handler */
@@ -1273,6 +1313,12 @@ void create_gui()
   add_button(265, 610, 55, 24, "-1%", ID_BTN_TRIGGER_DEADZONE_DOWN);
   add_button(325, 610, 55, 24, "+1%", ID_BTN_TRIGGER_DEADZONE_UP);
   HWND_TRIGGER_PREVIEW = add_label(390, 612, 420, 20, "", ID_LABEL_TRIGGER_PREVIEW);
+  add_label(10, 640, 400, 20, "Trigger click threshold: -1 = use hardware click, 0-1 = synthesize", 0);
+  HWND_CLICK_VALUE = add_readonly(415, 640, 90, 20, "-1 (hardware)", ID_LABEL_CLICK);
+  add_button(510, 640, 55, 24, "-0.01", ID_BTN_CLICK_DOWN);
+  add_button(570, 640, 55, 24, "+0.01", ID_BTN_CLICK_UP);
+  add_button(630, 640, 60, 24, "-1 (off)", ID_BTN_CLICK_OFF);
+  add_button(10, 668, 180, 24, "Dump action table", ID_BTN_DUMP_ACTIONS);
   update_trigger_threshold_display();
 
   // tamanho ajuste

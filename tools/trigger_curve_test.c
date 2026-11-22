@@ -139,6 +139,79 @@ int main(void)
     }
   }
 
+  {
+    /* Reference copy of the pre-change algorithm (commit 8abeb52) for bit-identity checks. */
+    CoreTriggerCfg a, b;
+    int id_force = 1, id_range = 1, id_click = 1, id_bool = 1;
+    unsigned int seed = 12345u;
+    core_trigger_cfg_defaults(&a);
+    a.deadzone = 0.15f;
+    a.exponent = 1.7f;
+    a.gain = 1.3f;
+    a.press_threshold = 0.4f;
+    b = a;
+    for (int i = 0; i < 10000; ++i)
+    {
+      float v;
+      float ref_curve, ref_out;
+      float v1;
+      seed = seed * 1664525u + 1013904223u;
+      v = ((seed >> 8) & 0xFFFF) / 65535.0f * 1.2f - 0.1f;
+      v1 = v >= 0.0f ? (v > 1.0f ? 1.0f : v) : 0.0f;
+      v1 = (v1 - a.deadzone) / (1.0f - a.deadzone);
+      v1 = v1 >= 0.0f ? (v1 > 1.0f ? 1.0f : v1) : 0.0f;
+      ref_curve = powf(v1, 1.0f / a.exponent);
+      ref_out = ref_curve * a.gain;
+      ref_out = ref_out >= 0.0f ? (ref_out > 1.0f ? 1.0f : ref_out) : 0.0f;
+      if (memcmp(&ref_out, &(float){core_trigger_output(v, &a)}, sizeof(float)) != 0)
+        id_force = 0;
+      b.force_value = -1.0f;
+      b.range_max = 1.0f;
+      if (core_trigger_output(v, &b) != core_trigger_output(v, &a))
+        id_range = 0;
+      if (core_trigger_pressed(v, &b) != (ref_curve >= a.press_threshold))
+        id_bool = 0;
+      (void)id_click;
+    }
+    check("force_value=-1 bit-identical to legacy output over 10000 samples", id_force);
+    check("range_max=1.0 identical over 10000 samples", id_range);
+    check("force/range disabled: Boolean identical to legacy over 10000 samples", id_bool);
+  }
+
+  {
+    CoreTriggerCfg f;
+    core_trigger_cfg_defaults(&f);
+    f.force_value = 0.10f;
+    ok = 1;
+    for (int i = 0; i <= 1000; ++i)
+      if (core_trigger_output(i / 1000.0f, &f) != 0.10f)
+        ok = 0;
+    check("force_value 0.10 ignores raw (analog constant)", ok);
+    check("force_value Boolean derived from forced value (0.10 vs thr 0.5 -> 0)", core_trigger_pressed(1.0f, &f) == 0);
+    f.force_value = 7.0f;
+    core_trigger_cfg_sanitize(&f);
+    check("force_value clamps to 1.0", core_trigger_output(0.0f, &f) == 1.0f);
+
+    core_trigger_cfg_defaults(&f);
+    f.range_max = 0.5f;
+    check("range_max 0.5: raw 0.5 -> 1.0", near(core_trigger_output(0.5f, &f), 1.0f));
+    check("range_max 0.5: raw 0.25 -> 0.5", near(core_trigger_output(0.25f, &f), 0.5f));
+
+    core_trigger_cfg_defaults(&f);
+    check("click threshold default is passthrough (-1, disabled)", !core_trigger_click_enabled(&f));
+    f.click_threshold = 0.0f;
+    check("click synth threshold 0.0: raw 0.0 -> click 1", core_trigger_click(0.0f, &f) == 1);
+    f.click_threshold = 0.5f;
+    check("click synth threshold 0.5: raw 0.49 -> 0, raw 0.5 -> 1",
+          core_trigger_click(0.49f, &f) == 0 && core_trigger_click(0.5f, &f) == 1);
+    f.click_threshold = 1.0f;
+    check("click synth threshold 1.0: raw 0.99 -> 0, raw 1.0 -> 1",
+          core_trigger_click(0.99f, &f) == 0 && core_trigger_click(1.0f, &f) == 1);
+    f.click_threshold = 0.5f;
+    f.exponent = 2.0f;
+    check("click uses curved value: raw 0.25 exp 2 -> curved 0.5 -> click 1", core_trigger_click(0.25f, &f) == 1);
+  }
+
   printf("%s (%d failure(s))\n", failures ? "OVERALL FAIL" : "OVERALL PASS", failures);
   return failures ? 1 : 0;
 }

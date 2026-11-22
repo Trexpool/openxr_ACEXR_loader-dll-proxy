@@ -19,7 +19,12 @@ typedef struct
   float exponent;        /* [0.01, 20], default 1 */
   float press_threshold; /* [0, 1], default 0.5 */
   float gain;            /* [0, 100], default 1, analog path only */
+  float force_value;     /* -1 = disabled; >=0 delivers exactly this constant (clamped [0,1]) */
+  float range_max;       /* (0,1], default 1; raw is divided by this before deadzone/exponent */
+  float click_threshold; /* -1 = pass hardware click through; >=0 synthesize click = curved >= t */
 } CoreTriggerCfg;
+int core_trigger_click_enabled(const CoreTriggerCfg *cfg);
+int core_trigger_click(float raw, const CoreTriggerCfg *cfg);
 
 void core_trigger_cfg_defaults(CoreTriggerCfg *cfg);
 void core_trigger_cfg_sanitize(CoreTriggerCfg *cfg);
@@ -33,7 +38,21 @@ int core_trigger_note_negative_threshold(void);
 #define CORE_HAND_RIGHT 1
 #define CORE_HAND_LEFT 2
 void core_trigger_reset_sources(void);
-void core_trigger_note_action(XrAction action, XrActionType type);
+void core_trigger_note_action(XrAction action, XrActionType type, const char *name);
+int core_trigger_click_flags(XrAction action);
+const char *core_click_source_path(XrAction action);
+const char *core_action_name(XrAction action);
+void core_trigger_set_target(const char *name);
+const char *core_trigger_target(void);
+int core_trigger_value_action_count(int hand_flag);
+int core_trigger_target_excludes(XrAction action);
+#define CORE_QUERY_FIRST_CLICK 1
+#define CORE_QUERY_FIRST_UNMODIFIED 2
+int core_query_note(XrAction action, int modified);
+int core_action_table_count(void);
+int core_action_table_format(int index, char *buf, size_t size);
+void core_trigger_summary(char *buf, size_t size);
+int core_click_log_gate(int runtime, int out, unsigned long long now_ms);
 void core_trigger_mark_source(XrAction action, const char *source_path);
 int core_trigger_hand_flags(XrAction action);
 const char *core_trigger_source_path(XrAction action);

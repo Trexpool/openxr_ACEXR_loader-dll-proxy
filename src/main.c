@@ -1,5 +1,5 @@
-/*
-    Copyright (C) 2022 Aru� Metello <aruametello@gmail.com>
+﻿/*
+    Copyright (C) 2022 Aruï¿½ Metello <aruametello@gmail.com>
 
     Permission to use, copy, modify, and/or distribute this software for any
     purpose with or without fee is hereby granted, provided that the above
@@ -118,6 +118,11 @@ double trigger_press_threshold = 0.50;
 double trigger_deadzone = 0.0;
 double trigger_curve_exponent = 1.0;
 double trigger_gain = 1.0;
+double trigger_force_value = -1.0;
+double trigger_click_threshold = -1.0;
+double trigger_range_max = 1.0;
+char trigger_target_action[128] = "";
+volatile LONG action_dump_requested = 0;
 
 /*
     some default values for the offsets
@@ -195,6 +200,13 @@ volatile LONG pose_capture_right = 0;
 
 int log_message(const char *fmt, ...);
 static XrInstance diag_instance = XR_NULL_HANDLE;
+static void proxy_dump_action_table(const char *why);
+static void proxy_exit_summary(void)
+{
+  char line[256];
+  core_trigger_summary(line, sizeof(line));
+  log_message("%s", line);
+}
 static Quaternion quaternion_from_xr(const XrQuaternionf *orientation)
 {
   Quaternion result;
@@ -221,6 +233,9 @@ static void proxy_trigger_cfg(CoreTriggerCfg *cfg)
   cfg->exponent = (float)trigger_curve_exponent;
   cfg->press_threshold = (float)trigger_press_threshold;
   cfg->gain = (float)trigger_gain;
+  cfg->force_value = (float)trigger_force_value;
+  cfg->range_max = (float)trigger_range_max;
+  cfg->click_threshold = (float)trigger_click_threshold;
   core_trigger_cfg_sanitize(cfg);
 }
 
@@ -577,6 +592,35 @@ int read_config(char *config_file)
       continue;
     }
 
+    if (strcmp(cmd, "trigger_force_value") == 0)
+    {
+      if (sscanf(value, "%lf", &double_temp) == 1)
+        trigger_force_value = double_temp < 0.0 ? -1.0 : (double_temp > 1.0 ? 1.0 : double_temp);
+      continue;
+    }
+
+    if (strcmp(cmd, "trigger_click_threshold") == 0)
+    {
+      if (sscanf(value, "%lf", &double_temp) == 1)
+        trigger_click_threshold = double_temp < 0.0 ? -1.0 : (double_temp > 1.0 ? 1.0 : double_temp);
+      continue;
+    }
+
+    if (strcmp(cmd, "trigger_range_max") == 0)
+    {
+      if (sscanf(value, "%lf", &double_temp) == 1 && double_temp > 0.0)
+        trigger_range_max = double_temp > 1.0 ? 1.0 : double_temp;
+      continue;
+    }
+
+    if (strcmp(cmd, "trigger_target_action") == 0)
+    {
+      strncpy(trigger_target_action, value, sizeof(trigger_target_action) - 1);
+      trigger_target_action[sizeof(trigger_target_action) - 1] = 0;
+      core_trigger_set_target(trigger_target_action);
+      continue;
+    }
+
     if (strcmp(cmd, "trigger_gain") == 0)
     {
       if (sscanf(value, "%lf", &double_temp) == 1 && double_temp >= 0.0)
@@ -731,6 +775,12 @@ int write_config(const char *config_file)
     fprintf(arq, "trigger_deadzone=%f\n", trigger_deadzone);
     fprintf(arq, "trigger_curve_exponent=%f\n", trigger_curve_exponent);
     fprintf(arq, "trigger_gain=%f\n", trigger_gain);
+    fprintf(arq, "# -1 = disabled. >=0 delivers exactly this analog value (bisect the game's fire threshold).\n");
+    fprintf(arq, "trigger_force_value=%f\n", trigger_force_value);
+    fprintf(arq, "# -1 = use hardware click. 0-1 = synthesize click = (curved analog >= value).\n");
+    fprintf(arq, "trigger_click_threshold=%f\n", trigger_click_threshold);
+    fprintf(arq, "trigger_range_max=%f\n", trigger_range_max);
+    fprintf(arq, "trigger_target_action=%s\n", trigger_target_action);
     fprintf(arq, "capture_ads_apply_position=%d\n", capture_ads_apply_position ? 1 : 0);
     fprintf(arq, "# Add remap_source_<original_path>=<target_path> entries after paths are verified.\n");
     fprintf(arq, "# Gunman right-hand digital B/grip swap:\n");
@@ -1058,7 +1108,7 @@ static const char *action_name_for_handle(XrAction action)
     if (action_metadata[c] == action)
       return action_metadata_names[c];
   }
-  return "<unknown>";
+  return core_action_name(action);
 }
 
 static XrAction action_handle_for_name(const char *name)
@@ -1524,7 +1574,9 @@ XRAPI_ATTR XrResult XRAPI_CALL xrAttachSessionActionSets(
 
   log_message("xrAttachSessionActionSets %d", rand() % 1000);
 
-  return _xrAttachSessionActionSets(session, attachInfo);
+  XrResult attached = _xrAttachSessionActionSets(session, attachInfo);
+  proxy_dump_action_table("startup");
+  return attached;
 }
 
 // xrBeginFrame
@@ -1557,7 +1609,7 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCreateAction(
       action_metadata_names[action_metadata_cnt][sizeof(action_metadata_names[action_metadata_cnt]) - 1] = 0;
       action_metadata_cnt++;
     }
-    core_trigger_note_action(*action, createInfo->actionType);
+    core_trigger_note_action(*action, createInfo->actionType, createInfo->actionName);
 
     log_message("xrCreateAction parentActionset: %lu type: %d actiontype: %d actionname: %s localizedactionname: %s output: %lu",
                 actionSet,
@@ -1770,7 +1822,10 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCreateInstance(
   {
     XrResult created = _xrCreateInstance(createInfo, instance);
     if (created == XR_SUCCESS && instance)
+    {
       diag_instance = *instance;
+      atexit(proxy_exit_summary);
+    }
     return created;
   }
 }
@@ -1889,8 +1944,19 @@ XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateBoundSourcesForAction(
     uint32_t *sourceCountOutput,
     XrPath *sources)
 {
-  log_message("xrEnumerateBoundSourcesForAction %d", rand() % 1000);
-  return _xrEnumerateBoundSourcesForAction(session, enumerateInfo, sourceCapacityInput, sourceCountOutput, sources);
+  XrResult ret = _xrEnumerateBoundSourcesForAction(session, enumerateInfo, sourceCapacityInput, sourceCountOutput, sources);
+  if (ret == XR_SUCCESS && enumerateInfo && sources && sourceCountOutput && diag_instance != XR_NULL_HANDLE)
+  {
+    for (uint32_t c = 0; c < *sourceCountOutput && c < sourceCapacityInput; c++)
+    {
+      char path[XR_MAX_PATH_LENGTH];
+      binding_path_to_string(diag_instance, sources[c], path, sizeof(path));
+      core_trigger_mark_source(enumerateInfo->action, path);
+    }
+  }
+  log_message("xrEnumerateBoundSourcesForAction action=%s count=%u", action_name_for_handle(enumerateInfo ? enumerateInfo->action : XR_NULL_HANDLE),
+              sourceCountOutput ? *sourceCountOutput : 0);
+  return ret;
 }
 
 // xrEnumerateEnvironmentBlendModes
@@ -2012,85 +2078,159 @@ static int proxy_trigger_match(XrAction action, XrPath sub, int want_bool, const
   return 1;
 }
 
+static void proxy_dump_action_table(const char *why)
+{
+  char line[2048];
+  log_message("ACTION_TABLE dump reason=%s count=%d", why, core_action_table_count());
+  for (int c = 0; c < core_action_table_count(); c++)
+  {
+	if (core_action_table_format(c, line, sizeof(line)))
+	  log_message("%s", line);
+  }
+}
+
+static int proxy_click_match(XrAction action, XrPath sub)
+{
+  int flags = core_trigger_click_flags(action);
+  if (!(flags & CORE_HAND_RIGHT))
+	return 0;
+  return sub == id_user_hand_right || (sub == XR_NULL_PATH && flags == CORE_HAND_RIGHT);
+}
+
+static void proxy_note_query(XrAction action, int modified, const char *kind)
+{
+  int r = core_query_note(action, modified);
+  if (r & CORE_QUERY_FIRST_CLICK)
+	log_message("*** GAME QUERIES TRIGGER CLICK ACTION: action=\"%s\" source=%s (%s) modified=%d ***",
+				action_name_for_handle(action), core_click_source_path(action), kind, modified);
+  if (r & CORE_QUERY_FIRST_UNMODIFIED)
+	log_message("*** GAME QUERIES TRIGGER-BOUND ACTION THE PROXY IS NOT MODIFYING: action=\"%s\" value_source=%s click_source=%s (%s) ***",
+				action_name_for_handle(action), core_trigger_source_path(action), core_click_source_path(action), kind);
+}
+
 static void proxy_trigger_diag(const char *method, XrAction action, float raw, const CoreTriggerCfg *cfg)
 {
   float curved = core_trigger_curve(raw, cfg);
   int pressed = core_trigger_pressed(raw, cfg);
   if (core_trigger_log_gate(raw, curved, pressed, (unsigned long long)GetTickCount64()))
   {
-    char line[512];
-    core_trigger_format_diag(line, sizeof(line), method, action_name_for_handle(action), action, "right",
-                             raw, curved, core_trigger_output(raw, cfg), pressed, cfg);
-    log_message("%s", line);
+	char line[768];
+	core_trigger_format_diag(line, sizeof(line), method, action_name_for_handle(action), action, "right",
+							 raw, curved, core_trigger_output(raw, cfg), pressed, cfg);
+	log_message("%s", line);
   }
 }
 
 // xrGetActionStateBoolean
 XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateBoolean(
-    XrSession session,
-    const XrActionStateGetInfo *getInfo,
-    XrActionStateBoolean *state)
+	XrSession session,
+	const XrActionStateGetInfo *getInfo,
+	XrActionStateBoolean *state)
 {
   XrResult ret = _xrGetActionStateBoolean(session, getInfo, state);
   const char *method = "";
+  int runtime_value = (ret == XR_SUCCESS && state) ? (int)state->currentState : 0;
+  int modified = 0;
 
   if (ret == XR_SUCCESS && getInfo && state && _xrGetActionStateFloat &&
-      proxy_trigger_match(getInfo->action, getInfo->subactionPath, 1, &method))
+	  proxy_trigger_match(getInfo->action, getInfo->subactionPath, 1, &method) &&
+	  !core_trigger_target_excludes(getInfo->action))
   {
-    XrAction trigger_action = core_trigger_sources_known()
-                                  ? core_trigger_find_float_action(CORE_HAND_RIGHT)
-                                  : action_handle_for_name("trigger");
-    if (trigger_action != XR_NULL_HANDLE)
-    {
-      XrActionStateGetInfo trigger_info = {XR_TYPE_ACTION_STATE_GET_INFO};
-      XrActionStateFloat trigger_state = {XR_TYPE_ACTION_STATE_FLOAT};
-      trigger_info.action = trigger_action;
-      trigger_info.subactionPath = getInfo->subactionPath;
+	XrAction trigger_action = core_trigger_sources_known()
+								  ? core_trigger_find_float_action(CORE_HAND_RIGHT)
+								  : action_handle_for_name("trigger");
+	if (trigger_action != XR_NULL_HANDLE)
+	{
+	  XrActionStateGetInfo trigger_info = {XR_TYPE_ACTION_STATE_GET_INFO};
+	  XrActionStateFloat trigger_state = {XR_TYPE_ACTION_STATE_FLOAT};
+	  trigger_info.action = trigger_action;
+	  trigger_info.subactionPath = getInfo->subactionPath;
 
-      if (_xrGetActionStateFloat(session, &trigger_info, &trigger_state) == XR_SUCCESS &&
-          trigger_state.isActive)
-      {
-        CoreTriggerCfg cfg;
-        proxy_trigger_cfg(&cfg);
-        if (core_trigger_method_first_use(strcmp(method, "source_path") == 0))
-          log_message("TRIGGER identification method: %s", method);
-        state->currentState = core_trigger_pressed(trigger_state.currentState, &cfg);
-        state->changedSinceLastSync = trigger_state.changedSinceLastSync;
-        state->lastChangeTime = trigger_state.lastChangeTime;
-        proxy_trigger_diag(method, trigger_action, trigger_state.currentState, &cfg);
-      }
-    }
+	  if (_xrGetActionStateFloat(session, &trigger_info, &trigger_state) == XR_SUCCESS &&
+		  trigger_state.isActive)
+	  {
+		CoreTriggerCfg cfg;
+		proxy_trigger_cfg(&cfg);
+		if (core_trigger_method_first_use(strcmp(method, "source_path") == 0))
+		  log_message("TRIGGER identification method: %s", method);
+		state->currentState = core_trigger_pressed(trigger_state.currentState, &cfg);
+		state->changedSinceLastSync = trigger_state.changedSinceLastSync;
+		state->lastChangeTime = trigger_state.lastChangeTime;
+		proxy_trigger_diag(method, trigger_action, trigger_state.currentState, &cfg);
+		modified = 1;
+	  }
+	}
+  }
+  else if (ret == XR_SUCCESS && getInfo && state && _xrGetActionStateFloat &&
+		   proxy_click_match(getInfo->action, getInfo->subactionPath))
+  {
+	CoreTriggerCfg cfg;
+	proxy_trigger_cfg(&cfg);
+	if (core_trigger_click_enabled(&cfg))
+	{
+	  XrAction trigger_action = core_trigger_find_float_action(CORE_HAND_RIGHT);
+	  if (trigger_action != XR_NULL_HANDLE)
+	  {
+		XrActionStateGetInfo trigger_info = {XR_TYPE_ACTION_STATE_GET_INFO};
+		XrActionStateFloat trigger_state = {XR_TYPE_ACTION_STATE_FLOAT};
+		trigger_info.action = trigger_action;
+		trigger_info.subactionPath = getInfo->subactionPath;
+		if (_xrGetActionStateFloat(session, &trigger_info, &trigger_state) == XR_SUCCESS &&
+			trigger_state.isActive)
+		{
+		  float raw = trigger_state.currentState;
+		  int out = core_trigger_click(raw, &cfg);
+		  state->currentState = out;
+		  modified = 1;
+		  log_message("CLICK_DIAG method=source_path action=\"%s\" source=%s runtime=%d out=%d curved=%.6f threshold=%.6f",
+					  action_name_for_handle(getInfo->action), core_click_source_path(getInfo->action),
+					  runtime_value, out, core_trigger_curve(raw, &cfg), cfg.click_threshold);
+		}
+	  }
+	}
   }
 
-  log_message("xrGetActionStateBoolean %d", rand() % 1000);
+  if (ret == XR_SUCCESS && getInfo && state)
+  {
+	proxy_note_query(getInfo->action, modified, "boolean");
+	log_message("xrGetActionStateBoolean action=%s runtime=%d out=%d modified=%d",
+				action_name_for_handle(getInfo->action), runtime_value, (int)state->currentState, modified);
+  }
   return ret;
 }
 
 // xrGetActionStateFloat
 XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateFloat(
-    XrSession session,
-    const XrActionStateGetInfo *getInfo,
-    XrActionStateFloat *state)
+	XrSession session,
+	const XrActionStateGetInfo *getInfo,
+	XrActionStateFloat *state)
 {
   XrResult ret = _xrGetActionStateFloat(session, getInfo, state);
   const char *method = "";
+  float runtime_value = (ret == XR_SUCCESS && state) ? state->currentState : 0.0f;
+  int modified = 0;
   if (ret == XR_SUCCESS && getInfo && state && state->isActive &&
-      proxy_trigger_match(getInfo->action, getInfo->subactionPath, 0, &method))
+	  proxy_trigger_match(getInfo->action, getInfo->subactionPath, 0, &method) &&
+	  !core_trigger_target_excludes(getInfo->action))
   {
-    CoreTriggerCfg cfg;
-    float raw = state->currentState;
-    proxy_trigger_cfg(&cfg);
-    if (core_trigger_method_first_use(strcmp(method, "source_path") == 0))
-      log_message("TRIGGER identification method: %s", method);
-    state->currentState = core_trigger_output(raw, &cfg);
-    core_trigger_track(raw, state->currentState);
-    proxy_trigger_diag(method, getInfo->action, raw, &cfg);
+	CoreTriggerCfg cfg;
+	float raw = state->currentState;
+	proxy_trigger_cfg(&cfg);
+	if (core_trigger_method_first_use(strcmp(method, "source_path") == 0))
+	  log_message("TRIGGER identification method: %s", method);
+	state->currentState = core_trigger_output(raw, &cfg);
+	core_trigger_track(raw, state->currentState);
+	proxy_trigger_diag(method, getInfo->action, raw, &cfg);
+	modified = 1;
   }
-  log_message("xrGetActionStateFloat action=%s threshold=%.3f value=%.3f result=%d",
-              getInfo ? action_name_for_handle(getInfo->action) : "<none>",
-              trigger_press_threshold,
-              state ? state->currentState : 0.0f,
-              ret);
+  if (ret == XR_SUCCESS && getInfo && state)
+	proxy_note_query(getInfo->action, modified, "float");
+  log_message("xrGetActionStateFloat action=%s runtime=%.6f out=%.6f modified=%d result=%d",
+			  getInfo ? action_name_for_handle(getInfo->action) : "<none>",
+			  runtime_value,
+			  state ? state->currentState : 0.0f,
+			  modified,
+			  ret);
   return ret;
 }
 
@@ -2583,6 +2723,8 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSyncActions(
     const XrActionsSyncInfo *syncInfo)
 {
   log_message("xrSyncActions %d", rand() % 1000);
+  if (InterlockedExchange(&action_dump_requested, 0))
+    proxy_dump_action_table("gui_request");
   return _xrSyncActions(session, syncInfo);
 }
 

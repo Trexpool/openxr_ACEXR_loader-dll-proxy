@@ -40,3 +40,14 @@ the makefile has a target named "dll_release" that produces the desired, require
 - `trigger_gain` affects only the analog value, which is always clamped to [0,1] after gain.
 - Below `trigger_deadzone` the analog output is exactly 0.0.
 
+
+## Fire-path instruments (trigger)
+Config keys (proxy config and API-layer config):
+- trigger_click_threshold (-1 = passthrough hardware /input/trigger/click, 0-1 = synthesize click = curved analog >= t). Most likely lever on fire depth. GUI: "Trigger click threshold: -1 = use hardware click, 0-1 = synthesize".
+- trigger_force_value (-1 = disabled, 0-1 = deliver this constant as the trigger analog; log says forced). Bisect the game's threshold with it.
+- trigger_range_max ((0,1], default 1): raw is divided by it before deadzone/exponent.
+- trigger_target_action (default empty): with 2+ actions bound to trigger/value, curve only the named action.
+- Every action-state query is logged by action NAME; ACTION name=.. sources=[..] hands=[..] table is dumped at startup and via the GUI button. CLICK_DIAG lines report click handling; unmodified trigger-bound queries are flagged.
+- Exit summary: sample count, min, max, p99 of raw trigger.
+
+Hypothesis (unproven): with the old build and trigger_press_threshold=0.0 the Boolean was (value >= 0.0), always true, which may explain the earlier no-fire results.

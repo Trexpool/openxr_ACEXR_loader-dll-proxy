@@ -47,6 +47,7 @@ typedef struct
 typedef struct
 {
   float trigger_press_threshold;
+  CoreTriggerCfg trigger;
   int right_hand_frame_local;
   float offset_rotation_right_x;
   float offset_rotation_right_y;
@@ -89,7 +90,8 @@ static uint32_t right_pose_correction_log_counter;
 
 static float apply_negative_trigger_sensitivity(float original, float threshold)
 {
-  return core_trigger_sensitivity(original, threshold);
+  (void)threshold;
+  return core_trigger_output(original, &config.trigger);
 }
 
 static const char *action_name(XrAction action)
@@ -134,7 +136,12 @@ static float deg_to_rad(float value)
 
 static void layer_log(const char *text)
 {
-  FILE *file = fopen("openxr_api_layer.log", "a");
+  static long log_bytes = 0;
+  FILE *file;
+  if (log_bytes > 20L * 1024L * 1024L)
+    return;
+  log_bytes += (long)strlen(text) + 1;
+  file = fopen("openxr_api_layer.log", "a");
   if (file)
   {
 	fprintf(file, "%s\n", text);
@@ -173,6 +180,7 @@ static void set_default_config(void)
 {
   memset(&config, 0, sizeof(config));
   config.trigger_press_threshold = DEFAULT_TRIGGER_PRESS_THRESHOLD;
+  core_trigger_cfg_defaults(&config.trigger);
   snprintf(config.binding_profile_process, sizeof(config.binding_profile_process), "%s",
 		   "readyornot-win64-shipping.exe");
 }
@@ -342,11 +350,33 @@ static void load_layer_config(void)
 
 	if (strcmp(command, "trigger_press_threshold") == 0 && sscanf(value, "%lf", &number) == 1)
 	{
-	  if (number < -3.0)
-		number = -3.0;
-	  if (number > 1.0)
-		number = 1.0;
-	  config.trigger_press_threshold = (float)number;
+	  if (number < 0.0 && core_trigger_note_negative_threshold())
+		layer_log("WARNING: negative threshold is not a sensitivity; use trigger_gain=N.N for gain and threshold=0..1 for the cutoff (file untouched, cutoff clamped to 0 in memory)");
+	  config.trigger.press_threshold = (float)number;
+	  core_trigger_cfg_sanitize(&config.trigger);
+	  config.trigger_press_threshold = config.trigger.press_threshold;
+	  continue;
+	}
+
+	if (strcmp(command, "trigger_gain") == 0 && sscanf(value, "%lf", &number) == 1)
+	{
+	  config.trigger.gain = (float)number;
+	  core_trigger_cfg_sanitize(&config.trigger);
+	  continue;
+	}
+
+	if (strcmp(command, "trigger_deadzone") == 0 && sscanf(value, "%lf", &number) == 1)
+	{
+	  config.trigger.deadzone = (float)number;
+	  core_trigger_cfg_sanitize(&config.trigger);
+	  continue;
+	}
+
+	if (strcmp(command, "trigger_curve_exponent") == 0 && sscanf(value, "%lf", &number) == 1)
+	{
+	  if (number > 0.0)
+		config.trigger.exponent = (float)number;
+	  core_trigger_cfg_sanitize(&config.trigger);
 	  continue;
 	}
 
@@ -487,6 +517,7 @@ static XrResult XRAPI_CALL layer_create_action(
 	}
 
 	actions[action_count].has_right_subaction = has_right;
+	core_trigger_note_action(*action, createInfo->actionType);
 	++action_count;
   }
   return result;
@@ -568,6 +599,7 @@ static XrResult XRAPI_CALL layer_suggest_bindings(
 	const char *name = action_name(binding->action);
 
 	binding_path_to_string(instance, binding->binding, source_path, sizeof(source_path));
+	core_trigger_mark_source(binding->action, source_path);
 	snprintf(final_path, sizeof(final_path), "%s", source_path);
 
 	if (profile_active && config.binding_remapping_enabled && rewritten)
@@ -719,6 +751,40 @@ static XrResult XRAPI_CALL layer_suggest_bindings(
   return result;
 }
 
+static int layer_trigger_match(XrAction action, XrPath sub, int want_bool, const char **method)
+{
+  if (core_trigger_sources_known())
+  {
+	int flags = core_trigger_hand_flags(action);
+	if (!(flags & CORE_HAND_RIGHT))
+	  return 0;
+	if (sub != right_hand_path && !(sub == XR_NULL_PATH && flags == CORE_HAND_RIGHT))
+	  return 0;
+	*method = "source_path";
+	return 1;
+  }
+  if (sub != right_hand_path)
+	return 0;
+  if (!is_action_named(action, want_bool ? "triggerpressed" : "trigger"))
+	return 0;
+  *method = "action_name_fallback";
+  return 1;
+}
+
+static void layer_trigger_diag(const char *method, XrAction action, float raw)
+{
+  float curved = core_trigger_curve(raw, &config.trigger);
+  int pressed = core_trigger_pressed(raw, &config.trigger);
+  if (core_trigger_log_gate(raw, curved, pressed, (unsigned long long)GetTickCount64()))
+  {
+	char line[512];
+	core_trigger_format_diag(line, sizeof(line), method, action_name(action), action, "right", raw,
+							 curved, core_trigger_output(raw, &config.trigger), pressed,
+							 &config.trigger);
+	layer_log(line);
+  }
+}
+
 static XrResult XRAPI_CALL layer_get_action_state_boolean(
 	XrSession session,
 	const XrActionStateGetInfo *getInfo,
@@ -726,15 +792,17 @@ static XrResult XRAPI_CALL layer_get_action_state_boolean(
 {
   XrResult result = next_get_action_state_boolean(session, getInfo, state);
   XrBool32 original_state = state ? state->currentState : XR_FALSE;
+  const char *method = "";
 
   load_layer_config();
   if (getInfo && state)
   {
 	if (result == XR_SUCCESS &&
-		is_action_named(getInfo->action, "triggerpressed") &&
-		getInfo->subactionPath != XR_NULL_PATH)
+		layer_trigger_match(getInfo->action, getInfo->subactionPath, 1, &method))
 	{
-	  XrAction trigger_action = action_handle_for_name("trigger");
+	  XrAction trigger_action = core_trigger_sources_known()
+									? core_trigger_find_float_action(CORE_HAND_RIGHT)
+									: action_handle_for_name("trigger");
 	  XrActionStateGetInfo trigger_info = {XR_TYPE_ACTION_STATE_GET_INFO};
 	  XrActionStateFloat trigger_state = {XR_TYPE_ACTION_STATE_FLOAT};
 
@@ -745,13 +813,16 @@ static XrResult XRAPI_CALL layer_get_action_state_boolean(
 		if (next_get_action_state_float(session, &trigger_info, &trigger_state) == XR_SUCCESS &&
 			trigger_state.isActive)
 		{
-		  float effective_trigger = apply_negative_trigger_sensitivity(trigger_state.currentState,
-													 config.trigger_press_threshold);
-		  state->currentState = effective_trigger >= (config.trigger_press_threshold > 0.0f
-															 ? config.trigger_press_threshold
-															 : 0.0f);
+		  if (core_trigger_method_first_use(strcmp(method, "source_path") == 0))
+		  {
+			char m[96];
+			snprintf(m, sizeof(m), "TRIGGER identification method: %s", method);
+			layer_log(m);
+		  }
+		  state->currentState = core_trigger_pressed(trigger_state.currentState, &config.trigger);
 		  state->changedSinceLastSync = trigger_state.changedSinceLastSync;
 		  state->lastChangeTime = trigger_state.lastChangeTime;
+		  layer_trigger_diag(method, trigger_action, trigger_state.currentState);
 		}
 	  }
 	}
@@ -775,16 +846,24 @@ static XrResult XRAPI_CALL layer_get_action_state_float(
 {
   XrResult result = next_get_action_state_float(session, getInfo, state);
   float original_state = state ? state->currentState : 0.0f;
+  const char *method = "";
 
   load_layer_config();
   if (getInfo && state)
   {
 	if (result == XR_SUCCESS && state->isActive &&
-		is_action_named(getInfo->action, "trigger") &&
-		getInfo->subactionPath == right_hand_path)
+		layer_trigger_match(getInfo->action, getInfo->subactionPath, 0, &method))
 	{
-	  state->currentState = apply_negative_trigger_sensitivity(state->currentState,
-										 config.trigger_press_threshold);
+	  float raw = state->currentState;
+	  if (core_trigger_method_first_use(strcmp(method, "source_path") == 0))
+	  {
+		char m[96];
+		snprintf(m, sizeof(m), "TRIGGER identification method: %s", method);
+		layer_log(m);
+	  }
+	  state->currentState = core_trigger_output(raw, &config.trigger);
+	  core_trigger_track(raw, state->currentState);
+	  layer_trigger_diag(method, getInfo->action, raw);
 	}
 
 	{
@@ -915,6 +994,7 @@ LAYER_EXPORT XRAPI_ATTR XrResult XRAPI_CALL xrCreateApiLayerInstance(
   memset(config_path, 0, sizeof(config_path));
   config_write_time_valid = 0;
   action_count = 0;
+  core_trigger_reset_sources();
   right_hand_action_space_count = 0;
   right_pose_correction_log_counter = 0;
 

@@ -55,6 +55,9 @@ extern double offset_position_right_z;
 extern int right_hand_frame_local;
 extern int capture_ads_apply_position;
 extern double trigger_press_threshold;
+extern double trigger_deadzone;
+extern double trigger_curve_exponent;
+extern double trigger_gain;
 
 extern char config_file_path[256];
 

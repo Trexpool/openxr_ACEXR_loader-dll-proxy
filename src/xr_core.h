@@ -1,12 +1,54 @@
 #pragma once
+#include <stddef.h>
 #include <openxr/openxr.h>
 
 /* Shared by the legacy proxy (main.c) and the API layer (openxr_input_layer.c).
    Behavior here is the single source of truth; do not reimplement in callers. */
 
-/* threshold >= 0: values below threshold -> 0 (cutoff).
-   threshold <  0: gain of (1 + -threshold), clamped to [0,1]. */
-float core_trigger_sensitivity(float original, float threshold);
+/* Trigger response (analog float path only).
+	 v1      = clamp((v - deadzone) / (1 - deadzone), 0, 1)   when deadzone > 0
+	 curved  = pow(v1, 1 / exponent)
+	 analog  = clamp(curved * gain, 0, 1)
+	 boolean = curved >= press_threshold    (threshold is applied to the CURVED value)
+   exponent > 1: LESS pull needed (easier). exponent < 1: DEEPER pull needed.
+   exponent == 1, deadzone == 0, gain == 1 is the identity. Outputs are always in [0,1].
+   NOTE: press_threshold == 0 makes the Boolean always true (value >= 0). */
+typedef struct
+{
+  float deadzone;        /* [0, 0.9], default 0 */
+  float exponent;        /* [0.01, 20], default 1 */
+  float press_threshold; /* [0, 1], default 0.5 */
+  float gain;            /* [0, 100], default 1, analog path only */
+} CoreTriggerCfg;
+
+void core_trigger_cfg_defaults(CoreTriggerCfg *cfg);
+void core_trigger_cfg_sanitize(CoreTriggerCfg *cfg);
+float core_trigger_curve(float v, const CoreTriggerCfg *cfg);
+float core_trigger_output(float v, const CoreTriggerCfg *cfg);
+int core_trigger_pressed(float raw, const CoreTriggerCfg *cfg);
+/* Returns 1 only the first time it is called in this process (caller logs the message). */
+int core_trigger_note_negative_threshold(void);
+
+/* Trigger identification by bound source path (/user/hand/<hand>/input/trigger/value). */
+#define CORE_HAND_RIGHT 1
+#define CORE_HAND_LEFT 2
+void core_trigger_reset_sources(void);
+void core_trigger_note_action(XrAction action, XrActionType type);
+void core_trigger_mark_source(XrAction action, const char *source_path);
+int core_trigger_hand_flags(XrAction action);
+const char *core_trigger_source_path(XrAction action);
+int core_trigger_sources_known(void);
+XrAction core_trigger_find_float_action(int hand_flag);
+/* Returns 1 the first time each identification method (1=source path, 0=action name) is used. */
+int core_trigger_method_first_use(int by_source_path);
+
+/* Throttled diagnostic: at most 4 per second, on change or once per second at rest. */
+/* Records raw min/max and rising edges (delivered analog 0.0f -> non-zero). Call from float path only. */
+void core_trigger_track(float raw, float out);
+int core_trigger_log_gate(float raw, float curved, int pressed, unsigned long long now_ms);
+void core_trigger_format_diag(char *buf, size_t size, const char *method, const char *action_name,
+							  XrAction action, const char *hand, float raw, float curved,
+							  float out, int pressed, const CoreTriggerCfg *cfg);
 
 /* Right-hand offset. rot_xyz are radians, stored as config keys x,y,z
    (rotation about OpenXR X, Y, Z respectively). pos_xyz are meters.

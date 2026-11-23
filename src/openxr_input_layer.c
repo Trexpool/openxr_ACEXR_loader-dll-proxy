@@ -132,19 +132,79 @@ static float deg_to_rad(float value)
   return value * (3.14159265358979323846f / 180.0f);
 }
 
+static int layer_binding_log = 1;
+static long layer_log_bytes;
+static int layer_log_seq;
+
 static void layer_log(const char *text)
 {
-  static long log_bytes = 0;
   FILE *file;
-  if (log_bytes > 20L * 1024L * 1024L)
-    return;
-  log_bytes += (long)strlen(text) + 1;
+  if (layer_log_bytes == 0)
+  {
+	file = fopen("openxr_api_layer.log", "rb");
+	if (file)
+	{
+	  fseek(file, 0, SEEK_END);
+	  layer_log_bytes = ftell(file);
+	  fclose(file);
+	}
+  }
+  if (layer_log_bytes > 5L * 1024L * 1024L)
+  {
+	char bak[96];
+	char old[96];
+	++layer_log_seq;
+	snprintf(bak, sizeof(bak), "log_%lu_%d.txt.bak", (unsigned long)GetCurrentProcessId(), layer_log_seq);
+	remove(bak);
+	rename("openxr_api_layer.log", bak);
+	if (layer_log_seq > 3)
+	{
+	  snprintf(old, sizeof(old), "log_%lu_%d.txt.bak", (unsigned long)GetCurrentProcessId(), layer_log_seq - 3);
+	  remove(old);
+	}
+	layer_log_bytes = 0;
+  }
+  layer_log_bytes += (long)strlen(text) + 1;
   file = fopen("openxr_api_layer.log", "a");
   if (file)
   {
 	fprintf(file, "%s\n", text);
 	fclose(file);
   }
+}
+
+static int layer_throttle_ok(void)
+{
+  static unsigned long long window_start;
+  static int count;
+  unsigned long long now = (unsigned long long)GetTickCount64();
+  if (layer_binding_log <= 0)
+	return 0;
+  if (layer_binding_log >= 2)
+	return 1;
+  if (now - window_start >= 1000ULL)
+  {
+	window_start = now;
+	count = 0;
+  }
+  if (count >= 4)
+	return 0;
+  ++count;
+  return 1;
+}
+
+static int layer_log_changed(XrAction action, float a, float b, int c)
+{
+  static struct { XrAction h; float a, b; int c; int used; } slot[64];
+  unsigned idx = (unsigned)((unsigned long long)action % 64);
+  if (slot[idx].used && slot[idx].h == action && slot[idx].a == a && slot[idx].b == b && slot[idx].c == c)
+	return 0;
+  slot[idx].used = 1;
+  slot[idx].h = action;
+  slot[idx].a = a;
+  slot[idx].b = b;
+  slot[idx].c = c;
+  return 1;
 }
 
 static void identify_process(void)
@@ -373,6 +433,13 @@ static void load_layer_config(void)
 	if (strcmp(command, "click_mode") == 0 && core_click_mode_parse(value) >= 0)
 	{
 	  config.trigger.click_mode = core_click_mode_parse(value);
+	  continue;
+	}
+
+	if (strcmp(command, "binding_log") == 0)
+	{
+	  int v = atoi(value);
+	  layer_binding_log = (v < 0 || v > 2) ? 1 : v;
 	  continue;
 	}
 
@@ -789,18 +856,24 @@ static XrResult XRAPI_CALL layer_suggest_bindings(
   return result;
 }
 
+static int layer_hand_match(XrPath sub, int hands)
+{
+  if (!(hands & CORE_HAND_RIGHT))
+	return 0;
+  return sub == right_hand_path || (sub == XR_NULL_PATH && hands == CORE_HAND_RIGHT);
+}
+
 static int layer_trigger_match(XrAction action, XrPath sub, int want_bool, const char **method)
 {
-  if (core_trigger_sources_known())
+  int hands = 0, m = 0;
+  int role = core_action_role(action, &hands, &m);
+  if (role == CORE_ROLE_AXIS && layer_hand_match(sub, hands))
   {
-	int flags = core_trigger_hand_flags(action);
-	if (!(flags & CORE_HAND_RIGHT))
-	  return 0;
-	if (sub != right_hand_path && !(sub == XR_NULL_PATH && flags == CORE_HAND_RIGHT))
-	  return 0;
-	*method = "source_path";
+	*method = (m == CORE_METHOD_NAME) ? "action_name_fallback" : "source_path";
 	return 1;
   }
+  if (core_trigger_sources_known() || role != CORE_ROLE_OTHER)
+	return 0;
   if (sub != right_hand_path)
 	return 0;
   if (!is_action_named(action, want_bool ? "triggerpressed" : "trigger"))
@@ -812,30 +885,50 @@ static int layer_trigger_match(XrAction action, XrPath sub, int want_bool, const
 static void layer_dump_action_table(const char *why)
 {
   char line[2048];
-  char head[96];
-  snprintf(head, sizeof(head), "ACTION_TABLE dump reason=%s count=%d", why, core_action_table_count());
+  char head[160];
+  FILE *tf = fopen("action_table.txt", "w");
+  snprintf(head, sizeof(head), "ACTION_TABLE dump reason=%s count=%d file=action_table.txt cap=5242880", why, core_action_table_count());
   layer_log(head);
   for (int i = 0; i < core_action_table_count(); ++i)
+  {
 	if (core_action_table_format(i, line, sizeof(line)))
+	{
 	  layer_log(line);
+	  if (tf)
+		fprintf(tf, "%s\n", line);
+	}
+	if (core_action_role_format(i, line, sizeof(line)))
+	  layer_log(line);
+  }
+  if (tf)
+	fclose(tf);
+  core_pair_format(CORE_HAND_RIGHT, line, sizeof(line));
+  layer_log(line);
+  core_pair_format(CORE_HAND_LEFT, line, sizeof(line));
+  layer_log(line);
 }
 
-static void layer_note_query(XrAction action, int modified, const char *kind)
+static void layer_note_query(XrAction action, int modified, const char *kind, int runtime_nonzero)
 {
   char message[768];
-  int r = core_query_note(action, modified);
+  int r = core_query_note(action, modified, runtime_nonzero);
   if (r & CORE_QUERY_FIRST_CLICK)
   {
 	snprintf(message, sizeof(message),
-			 "*** GAME QUERIES TRIGGER CLICK ACTION: action=\"%s\" source=%s (%s) modified=%d ***",
-			 action_name(action), core_click_source_path(action), kind, modified);
+			 "*** GAME QUERIES TRIGGER CLICK ACTION: action=\"%s\" source=%s (%s) ***",
+			 action_name(action), core_click_source_path(action), kind);
 	layer_log(message);
   }
   if (r & CORE_QUERY_FIRST_UNMODIFIED)
   {
 	snprintf(message, sizeof(message),
-			 "*** GAME QUERIES TRIGGER-BOUND ACTION THE PROXY IS NOT MODIFYING: action=\"%s\" value_source=%s click_source=%s (%s) ***",
-			 action_name(action), core_trigger_source_path(action), core_click_source_path(action), kind);
+			 "*** BUG: ANALOG-ROLE ACTION NOT MODIFIED: action=\"%s\" source=%s (%s) ***",
+			 action_name(action), core_trigger_source_path(action), kind);
+	layer_log(message);
+  }
+  if (r & CORE_QUERY_CLICK_ALWAYS_ZERO)
+  {
+	snprintf(message, sizeof(message), "INFO click action=\"%s\" runtime value has always been 0 so far", action_name(action));
 	layer_log(message);
   }
 }
@@ -874,10 +967,10 @@ static XrResult XRAPI_CALL layer_attach_action_sets(
 
 static int layer_click_match(XrAction action, XrPath sub)
 {
-  int flags = core_trigger_click_flags(action);
-  if (!(flags & CORE_HAND_RIGHT))
+  int hands = 0;
+  if (core_action_role(action, &hands, NULL) != CORE_ROLE_CLICK)
 	return 0;
-  return sub == right_hand_path || (sub == XR_NULL_PATH && flags == CORE_HAND_RIGHT);
+  return layer_hand_match(sub, hands);
 }
 
 static void layer_trigger_diag(const char *method, XrAction action, float raw)
@@ -940,31 +1033,48 @@ static XrResult XRAPI_CALL layer_get_action_state_boolean(
 		}
 	  }
 	}
-	else if (result == XR_SUCCESS && layer_click_match(getInfo->action, getInfo->subactionPath) &&
-			 core_trigger_click_enabled(&config.trigger))
+	else if (result == XR_SUCCESS && layer_click_match(getInfo->action, getInfo->subactionPath))
 	{
-	  XrAction trigger_action = core_trigger_find_float_action(CORE_HAND_RIGHT);
-	  XrActionStateGetInfo trigger_info = {XR_TYPE_ACTION_STATE_GET_INFO};
-	  XrActionStateFloat trigger_state = {XR_TYPE_ACTION_STATE_FLOAT};
-	  if (trigger_action != XR_NULL_HANDLE)
+	  char message[768];
+	  int have = 0, det;
+	  float araw = 0.0f, aout = 0.0f;
+	  is_click = 1;
+	  det = core_detent_note(getInfo->action, (int)original_state);
+	  core_analog_cached(CORE_HAND_RIGHT, &aout, &araw);
+	  if (det)
 	  {
-		trigger_info.action = trigger_action;
-		trigger_info.subactionPath = getInfo->subactionPath;
-		if (next_get_action_state_float(session, &trigger_info, &trigger_state) == XR_SUCCESS &&
-			trigger_state.isActive)
+		snprintf(message, sizeof(message),
+				 "DETENT hand=right action=\"%s\" runtime_click %d -> %d analog_cached=%.6f analog_rawpull_cached=%.6f",
+				 action_name(getInfo->action), det == 1 ? 0 : 1, det == 1 ? 1 : 0, aout, araw);
+		layer_log(message);
+	  }
+	  state->currentState = core_click_synth(CORE_HAND_RIGHT, (int)original_state, &config.trigger, &compare, &have);
+	  if (!have && core_click_warn_noanalog(getInfo->action))
+	  {
+		snprintf(message, sizeof(message),
+				 "WARNING click action=\"%s\" has no analog value cached yet for hand=right; analog treated as 0.0, click passes through",
+				 action_name(getInfo->action));
+		layer_log(message);
+	  }
+	  if (core_trigger_click_enabled(&config.trigger))
+	  {
+		modified = 1;
+		if (core_click_changed(getInfo->action, (int)state->currentState))
 		{
-		  char message[768];
-		  float raw = trigger_state.currentState;
-		  compare = core_trigger_click_compare(raw, &config.trigger);
-		  state->currentState = core_trigger_click(raw, (int)original_state, &config.trigger);
-		  modified = 1;
-		  is_click = 1;
-		  (void)message;
+		  snprintf(message, sizeof(message),
+				   "CLICKSYN action=\"%s\" hand=right runtime=%d out=%d mode=%s compare=%.6f compare_kind=%s threshold=%.6f analog_cached=%.6f analog_rawpull_cached=%.6f",
+				   action_name(getInfo->action), (int)original_state, (int)state->currentState,
+				   core_click_mode_name(config.trigger.click_mode), compare,
+				   core_click_compare_name(config.trigger.click_compare), config.trigger.click_threshold, aout, araw);
+		  layer_log(message);
 		}
 	  }
 	}
 
-	layer_note_query(getInfo->action, modified, "boolean");
+	layer_note_query(getInfo->action, modified, "boolean", (int)original_state);
+	if (layer_binding_log > 0 &&
+		(layer_binding_log >= 2 || layer_log_changed(getInfo->action, (float)(int)original_state, (float)(int)state->currentState, is_click)) &&
+		layer_throttle_ok())
 	{
 	  char message[768];
 	  const char *bound = core_click_source_path(getInfo->action);
@@ -977,6 +1087,7 @@ static XrResult XRAPI_CALL layer_get_action_state_boolean(
 			   is_click ? core_click_compare_name(config.trigger.click_compare) : "not-click");
 	  layer_log(message);
 	}
+	if (layer_binding_log >= 2)
 	{
 	  char message[512];
 	  snprintf(message, sizeof(message),
@@ -1014,12 +1125,16 @@ static XrResult XRAPI_CALL layer_get_action_state_float(
 		layer_log(m);
 	  }
 	  state->currentState = core_trigger_output(raw, &config.trigger);
+	  core_analog_store(CORE_HAND_RIGHT, raw, &config.trigger);
 	  core_trigger_track(raw, state->currentState);
 	  layer_trigger_diag(method, getInfo->action, raw);
 	  modified = 1;
 	}
 
-	layer_note_query(getInfo->action, modified, "float");
+	layer_note_query(getInfo->action, modified, "float", 0);
+	if (layer_binding_log > 0 &&
+		(layer_binding_log >= 2 || layer_log_changed(getInfo->action, original_state, state->currentState, modified)) &&
+		layer_throttle_ok())
 	{
 	  char message[512];
 	  snprintf(message, sizeof(message),

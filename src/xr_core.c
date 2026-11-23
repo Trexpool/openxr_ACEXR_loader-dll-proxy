@@ -100,18 +100,23 @@ float core_trigger_click_compare(float raw, const CoreTriggerCfg *cfg)
   return core_trigger_pull(raw, cfg);
 }
 
-int core_trigger_click(float raw, int runtime_click, const CoreTriggerCfg *cfg)
+int core_trigger_click_value(float compare, int runtime_click, const CoreTriggerCfg *cfg)
 {
   int hit;
   runtime_click = runtime_click ? 1 : 0;
   if (!core_trigger_click_enabled(cfg))
 	return runtime_click;
-  hit = core_trigger_click_compare(raw, cfg) >= cfg->click_threshold;
+  hit = compare >= cfg->click_threshold;
   if (cfg->click_mode == CORE_CLICK_OR)
 	return runtime_click || hit;
   if (cfg->click_mode == CORE_CLICK_AND)
 	return runtime_click && hit;
   return hit;
+}
+
+int core_trigger_click(float raw, int runtime_click, const CoreTriggerCfg *cfg)
+{
+  return core_trigger_click_value(core_trigger_click_compare(raw, cfg), runtime_click, cfg);
 }
 
 int core_click_mode_parse(const char *s)
@@ -172,7 +177,21 @@ typedef struct
   int has_rt;
   int seen_click_query;
   int seen_unmodified_query;
+  int role_cached;
+  int role;
+  int role_hands;
+  int role_method;
+  int last_rt;
+  int last_syn;
+  int warned_noanalog;
+  unsigned long queries;
+  int rt_nonzero;
+  int zero_noted;
 } TriggerSource;
+
+static float cache_analog[2];
+static float cache_raw[2];
+static int cache_seen[2];
 
 static TriggerSource trigger_table[CORE_TRIGGER_TABLE];
 static int trigger_table_count;
@@ -271,6 +290,9 @@ void core_trigger_reset_sources(void)
 {
   trigger_table_count = 0;
   trigger_any_source = 0;
+  memset(cache_analog, 0, sizeof(cache_analog));
+  memset(cache_raw, 0, sizeof(cache_raw));
+  memset(cache_seen, 0, sizeof(cache_seen));
 }
 
 void core_trigger_note_action(XrAction action, XrActionType type, const char *name)
@@ -340,14 +362,14 @@ const char *core_trigger_source_path(XrAction action)
 {
   TriggerSource *e = trigger_entry(action, 0);
   const char *p = e ? entry_source(e, CORE_ROLE_AXIS, NULL) : NULL;
-  return p ? p : "<no-trigger-value-source>";
+  return p ? p : "<none>";
 }
 
 const char *core_click_source_path(XrAction action)
 {
   TriggerSource *e = trigger_entry(action, 0);
   const char *p = e ? entry_source(e, CORE_ROLE_CLICK, NULL) : NULL;
-  return p ? p : "<no-trigger-click-source>";
+  return p ? p : "<none>";
 }
 
 int core_click_source_confirmed(XrAction action)
@@ -422,20 +444,224 @@ int core_trigger_method_first_use(int by_source_path)
   return 1;
 }
 
-int core_query_note(XrAction action, int modified)
+static int ci_has(const char *lower, const char *w)
+{
+  return strstr(lower, w) != NULL;
+}
+
+static void resolve_role(TriggerSource *e)
+{
+  if (e->role_cached)
+	return;
+  for (int pass = 0; pass < 2; ++pass)
+  {
+	int ah = 0, ch = 0;
+	if (pass == 0 && !e->has_rt)
+	  continue;
+	for (int i = 0; i < e->nsrc; ++i)
+	{
+	  int hand = 0, r;
+	  if (pass == 0 && !e->rt[i])
+		continue;
+	  r = core_trigger_classify_path(e->src[i], &hand);
+	  if (r == CORE_ROLE_AXIS)
+		ah |= hand;
+	  else if (r == CORE_ROLE_CLICK)
+		ch |= hand;
+	}
+	if (ah || ch)
+	{
+	  e->role = ah ? CORE_ROLE_AXIS : CORE_ROLE_CLICK;
+	  e->role_hands = ah ? ah : ch;
+	  e->role_method = pass == 0 ? CORE_METHOD_PATH : CORE_METHOD_SUGGESTED;
+	  e->role_cached = 1;
+	  return;
+	}
+  }
+  if (e->nsrc == 0 && e->name[0])
+  {
+	char low[XR_MAX_ACTION_NAME_SIZE];
+	int role = CORE_ROLE_OTHER;
+	size_t n;
+	for (n = 0; e->name[n] && n < sizeof(low) - 1; ++n)
+	  low[n] = (e->name[n] >= 'A' && e->name[n] <= 'Z') ? (char)(e->name[n] + 32) : e->name[n];
+	low[n] = 0;
+	if (ci_has(low, "trigger") && (ci_has(low, "click") || ci_has(low, "pressed")))
+	  role = CORE_ROLE_CLICK;
+	else if (ci_has(low, "trigger") && (ci_has(low, "axis") || ci_has(low, "value") || ci_has(low, "pull") || strcmp(low, "trigger") == 0))
+	  role = CORE_ROLE_AXIS;
+	if (role != CORE_ROLE_OTHER)
+	{
+	  int h = 0;
+	  if (ci_has(low, "left"))
+		h = CORE_HAND_LEFT;
+	  else if (ci_has(low, "right"))
+		h = CORE_HAND_RIGHT;
+	  else
+		h = CORE_HAND_LEFT | CORE_HAND_RIGHT;
+	  e->role = role;
+	  e->role_hands = h;
+	  e->role_method = CORE_METHOD_NAME;
+	  e->role_cached = 1;
+	}
+  }
+}
+
+int core_action_role(XrAction action, int *hands, int *method)
+{
+  TriggerSource *e = trigger_entry(action, 0);
+  if (hands)
+	*hands = 0;
+  if (method)
+	*method = 0;
+  if (!e)
+	return CORE_ROLE_OTHER;
+  resolve_role(e);
+  if (!e->role_cached)
+	return CORE_ROLE_OTHER;
+  if (hands)
+	*hands = e->role_hands;
+  if (method)
+	*method = e->role_method;
+  return e->role;
+}
+
+const char *core_role_name(int role)
+{
+  return role == CORE_ROLE_AXIS ? "axis" : role == CORE_ROLE_CLICK ? "click" : "other";
+}
+
+const char *core_role_method_name(int method)
+{
+  return method == CORE_METHOD_PATH ? "path" : method == CORE_METHOD_SUGGESTED ? "suggested"
+		 : method == CORE_METHOD_NAME ? "name" : "none";
+}
+
+void core_analog_store(int hand, float raw, const CoreTriggerCfg *cfg)
+{
+  int i = hand == CORE_HAND_LEFT ? 1 : 0;
+  cache_analog[i] = core_trigger_output(raw, cfg);
+  cache_raw[i] = core_trigger_pull(raw, cfg);
+  cache_seen[i] = 1;
+}
+
+int core_analog_cached(int hand, float *analog, float *rawpull)
+{
+  int i = hand == CORE_HAND_LEFT ? 1 : 0;
+  if (analog)
+	*analog = cache_analog[i];
+  if (rawpull)
+	*rawpull = cache_raw[i];
+  return cache_seen[i];
+}
+
+int core_click_synth(int hand, int runtime_click, const CoreTriggerCfg *cfg, float *compare, int *have_analog)
+{
+  int i = hand == CORE_HAND_LEFT ? 1 : 0;
+  float c = 0.0f;
+  runtime_click = runtime_click ? 1 : 0;
+  if (cache_seen[i])
+	c = cfg->click_compare == CORE_COMPARE_CURVED ? cache_analog[i] : cache_raw[i];
+  if (compare)
+	*compare = c;
+  if (have_analog)
+	*have_analog = cache_seen[i];
+  if (!cache_seen[i] || !core_trigger_click_enabled(cfg))
+	return runtime_click;
+  return core_trigger_click_value(c, runtime_click, cfg);
+}
+
+int core_click_warn_noanalog(XrAction action)
+{
+  TriggerSource *e = trigger_entry(action, 0);
+  if (!e || e->warned_noanalog)
+	return 0;
+  e->warned_noanalog = 1;
+  return 1;
+}
+
+int core_click_changed(XrAction action, int out)
+{
+  TriggerSource *e = trigger_entry(action, 0);
+  out = out ? 1 : 0;
+  if (!e || e->last_syn == out)
+	return 0;
+  e->last_syn = out;
+  return 1;
+}
+
+int core_detent_note(XrAction action, int runtime_click)
+{
+  TriggerSource *e = trigger_entry(action, 0);
+  runtime_click = runtime_click ? 1 : 0;
+  if (!e || e->last_rt == runtime_click)
+	return 0;
+  e->last_rt = runtime_click;
+  return runtime_click ? 1 : 2;
+}
+
+int core_pair_format(int hand, char *buf, size_t size)
+{
+  char an[1024], ck[1024];
+  size_t ua = 0, uc = 0;
+  an[0] = ck[0] = 0;
+  for (int i = 0; i < trigger_table_count; ++i)
+  {
+	TriggerSource *e = &trigger_table[i];
+	resolve_role(e);
+	if (!e->role_cached || !(e->role_hands & hand))
+	  continue;
+	if (e->role == CORE_ROLE_AXIS && ua < sizeof(an))
+	  ua += (size_t)snprintf(an + ua, sizeof(an) - ua, "%s\"%s\"", ua ? "," : "", core_action_name(e->handle));
+	else if (e->role == CORE_ROLE_CLICK && uc < sizeof(ck))
+	  uc += (size_t)snprintf(ck + uc, sizeof(ck) - uc, "%s\"%s\"", uc ? "," : "", core_action_name(e->handle));
+  }
+  snprintf(buf, size, "PAIR hand=%s analog_action=%s click_action=%s", hand == CORE_HAND_LEFT ? "left" : "right",
+		   an[0] ? an : "NONE", ck[0] ? ck : "NONE");
+  return 1;
+}
+
+int core_action_role_format(int index, char *buf, size_t size)
+{
+  TriggerSource *e;
+  if (index < 0 || index >= trigger_table_count)
+	return 0;
+  e = &trigger_table[index];
+  resolve_role(e);
+  snprintf(buf, size, "ROLE action=\"%s\" handle=%llu role=%s method=%s", core_action_name(e->handle),
+		   (unsigned long long)e->handle, core_role_name(e->role_cached ? e->role : CORE_ROLE_OTHER),
+		   core_role_method_name(e->role_cached ? e->role_method : 0));
+  return 1;
+}
+
+int core_query_note(XrAction action, int modified, int runtime_nonzero)
 {
   int r = 0;
+  int hands = 0, m = 0;
+  int role;
   TriggerSource *e = trigger_entry(action, 0);
   if (!e)
 	return 0;
-  if (entry_flags(e, CORE_ROLE_CLICK) && !e->seen_click_query)
+  role = core_action_role(action, &hands, &m);
+  if (role == CORE_ROLE_CLICK && !e->seen_click_query)
   {
 	e->seen_click_query = 1;
 	r |= CORE_QUERY_FIRST_CLICK;
   }
-  if ((entry_flags(e, CORE_ROLE_AXIS) || entry_flags(e, CORE_ROLE_CLICK)) && !modified && !e->seen_unmodified_query)
+  if (role == CORE_ROLE_AXIS && (hands & CORE_HAND_RIGHT) && !modified && !e->seen_unmodified_query)
   {
-	e->seen_unmodified_query = 1;	r |= CORE_QUERY_FIRST_UNMODIFIED;
+	e->seen_unmodified_query = 1;
+	r |= CORE_QUERY_FIRST_UNMODIFIED;
+  }
+  if (role == CORE_ROLE_CLICK)
+  {
+	if (runtime_nonzero)
+	  e->rt_nonzero = 1;
+	if (++e->queries >= 600 && !e->rt_nonzero && !e->zero_noted)
+	{
+	  e->zero_noted = 1;
+	  r |= CORE_QUERY_CLICK_ALWAYS_ZERO;
+	}
   }
   return r;
 }
@@ -462,16 +688,25 @@ int core_action_table_format(int index, char *buf, size_t size)
 							 e->rt[i] ? "" : "(suggested)");
   if (!e->nsrc)
 	snprintf(sources, sizeof(sources), "UNRESOLVED:no-bound-path-known");
-  role = entry_flags(e, CORE_ROLE_AXIS) ? "axis"
-		 : entry_flags(e, CORE_ROLE_CLICK) ? "click"
-		 : entry_flags(e, CORE_ROLE_TOUCH) ? "touch" : "other";
+  resolve_role((TriggerSource *)e);
+  role = core_role_name(e->role_cached ? e->role : CORE_ROLE_OTHER);
   snprintf(hands, sizeof(hands), "%s%s%s", (e->hands & CORE_HAND_LEFT) ? "l" : "",
 		   ((e->hands & CORE_HAND_LEFT) && (e->hands & CORE_HAND_RIGHT)) ? " " : "",
 		   (e->hands & CORE_HAND_RIGHT) ? "r" : "");
-  snprintf(buf, size, "ACTION name=\"%s\" handle=%llu type=%s bound=[%s] role=%s hands=[%s]",
-		   core_action_name(e->handle), (unsigned long long)e->handle,
-		   e->type == XR_ACTION_TYPE_BOOLEAN_INPUT ? "bool" : e->type == XR_ACTION_TYPE_FLOAT_INPUT ? "float" : "other",
-		   sources, role, hands);
+  {
+	char low[XR_MAX_ACTION_NAME_SIZE];
+	size_t n;
+	int flag;
+	for (n = 0; e->name[n] && n < sizeof(low) - 1; ++n)
+	  low[n] = (e->name[n] >= 'A' && e->name[n] <= 'Z') ? (char)(e->name[n] + 32) : e->name[n];
+	low[n] = 0;
+	flag = ci_has(low, "trigger") || ci_has(low, "grip") || ci_has(low, "squeeze") || ci_has(low, "button") || ci_has(low, "click");
+	snprintf(buf, size, "ACTION name=\"%s\" handle=%llu type=%s bound=[%s] role=%s method=%s hands=[%s]%s",
+			 core_action_name(e->handle), (unsigned long long)e->handle,
+			 e->type == XR_ACTION_TYPE_BOOLEAN_INPUT ? "bool" : e->type == XR_ACTION_TYPE_FLOAT_INPUT ? "float" : "other",
+			 sources, role, core_role_method_name(e->role_cached ? e->role_method : 0), hands,
+			 flag ? " FLAG" : "");
+  }
   return 1;
 }
 

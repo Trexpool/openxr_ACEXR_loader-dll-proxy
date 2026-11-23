@@ -328,6 +328,128 @@ int main(void)
     core_trigger_reset_sources();
   }
 
+  /* ---- cross-action pairing, cache, roles ---- */
+  {
+    XrAction mrc = (XrAction)(uintptr_t)201, otc = (XrAction)(uintptr_t)202, oax = (XrAction)(uintptr_t)203,
+             max_ = (XrAction)(uintptr_t)204, lone = (XrAction)(uintptr_t)205, nm1 = (XrAction)(uintptr_t)206,
+             nm2 = (XrAction)(uintptr_t)207, tch = (XrAction)(uintptr_t)208;
+    CoreTriggerCfg cfg;
+    float compare = -1.0f, a = 0, r = 0;
+    int have = 0, hands = 0, method = 0;
+
+    core_trigger_reset_sources();
+    core_trigger_cfg_defaults(&cfg);
+    cfg.click_threshold = 0.25f;
+    cfg.exponent = 2.0f; /* curved = sqrt(raw) */
+    core_trigger_note_action(mrc, XR_ACTION_TYPE_BOOLEAN_INPUT, "mixedreality_right_trigger_click");
+    core_trigger_note_action(otc, XR_ACTION_TYPE_BOOLEAN_INPUT, "oculustouch_right_trigger_click");
+    core_trigger_note_action(oax, XR_ACTION_TYPE_FLOAT_INPUT, "oculustouch_right_trigger_axis");
+    core_trigger_note_action(max_, XR_ACTION_TYPE_FLOAT_INPUT, "mixedreality_right_trigger_axis");
+    core_trigger_note_action(tch, XR_ACTION_TYPE_BOOLEAN_INPUT, "oculustouch_right_trigger_touch");
+    core_trigger_mark_source(mrc, "/user/hand/right/input/trigger");
+    core_trigger_mark_source(otc, "/user/hand/right/input/trigger");
+    core_trigger_mark_source(oax, "/user/hand/right/input/trigger/value");
+    core_trigger_mark_source(max_, "/user/hand/right/input/trigger/value");
+    core_trigger_mark_source(tch, "/user/hand/right/input/trigger/touch");
+
+    check("both click actions classified click (path)",
+          core_action_role(mrc, &hands, &method) == CORE_ROLE_CLICK && hands == CORE_HAND_RIGHT && method == CORE_METHOD_SUGGESTED &&
+          core_action_role(otc, NULL, NULL) == CORE_ROLE_CLICK);
+    check("both analog actions classified axis", core_action_role(oax, NULL, NULL) == CORE_ROLE_AXIS && core_action_role(max_, NULL, NULL) == CORE_ROLE_AXIS);
+    check("touch is neither click nor axis", core_action_role(tch, NULL, NULL) == CORE_ROLE_OTHER);
+
+    /* click queried before axis: no analog yet -> passthrough, warn once, still click */
+    check("click without cached analog passes runtime through", core_click_synth(CORE_HAND_RIGHT, 0, &cfg, &compare, &have) == 0 && !have && compare == 0.0f);
+    check("click without analog: runtime 1 passes through", core_click_synth(CORE_HAND_RIGHT, 1, &cfg, NULL, &have) == 1);
+    check("no-analog warning fires once per action", core_click_warn_noanalog(mrc) == 1 && core_click_warn_noanalog(mrc) == 0);
+    check("no-analog action is still a click", core_action_role(mrc, NULL, NULL) == CORE_ROLE_CLICK);
+
+    /* axis read caches both values; two analog actions share the cache */
+    core_analog_store(CORE_HAND_RIGHT, 0.09f, &cfg); /* oculus axis */
+    core_analog_cached(CORE_HAND_RIGHT, &a, &r);
+    check("cache holds post-exponent and pre-exponent values", near(a, 0.3f) && near(r, 0.09f));
+    core_analog_store(CORE_HAND_RIGHT, 0.04f, &cfg); /* mixedreality axis updates same cache */
+    core_analog_cached(CORE_HAND_RIGHT, &a, &r);
+    check("second analog action updates the same per-hand cache", near(a, 0.2f) && near(r, 0.04f));
+    check("left hand cache independent", !core_analog_cached(CORE_HAND_LEFT, NULL, NULL));
+
+    /* previous-frame semantics: click read uses cached value stored earlier */
+    core_analog_store(CORE_HAND_RIGHT, 0.09f, &cfg);
+    cfg.click_compare = CORE_COMPARE_RAWPULL;
+    check("rawpull 0.09 < 0.25 -> click 0", core_click_synth(CORE_HAND_RIGHT, 0, &cfg, &compare, &have) == 0 && near(compare, 0.09f) && have);
+    cfg.click_compare = CORE_COMPARE_CURVED;
+    check("curved 0.3 >= 0.25 -> click 1", core_click_synth(CORE_HAND_RIGHT, 0, &cfg, &compare, &have) == 1 && near(compare, 0.3f));
+    core_analog_store(CORE_HAND_RIGHT, 0.5f, &cfg); /* axis queried after click this frame */
+    cfg.click_compare = CORE_COMPARE_RAWPULL;
+    check("click uses value cached BEFORE the later axis read in same frame",
+          core_click_synth(CORE_HAND_RIGHT, 0, &cfg, &compare, &have) == 1 && near(compare, 0.5f));
+    core_analog_store(CORE_HAND_RIGHT, 0.09f, &cfg);
+
+    /* both click actions synthesized independently */
+    check("mixedreality click synthesized from cache", core_click_synth(CORE_HAND_RIGHT, 0, &cfg, NULL, NULL) == 0);
+    core_analog_store(CORE_HAND_RIGHT, 0.4f, &cfg);
+    check("both same-path click actions synthesize 1",
+          core_click_synth(CORE_HAND_RIGHT, 0, &cfg, NULL, NULL) == 1 && core_click_synth(CORE_HAND_RIGHT, 0, &cfg, NULL, NULL) == 1);
+
+    /* click modes with cached analog */
+    core_analog_store(CORE_HAND_RIGHT, 0.4f, &cfg);
+    cfg.click_mode = CORE_CLICK_REPLACE;
+    check("replace: runtime 0 + hit -> 1, runtime 1 + hit -> 1", core_click_synth(CORE_HAND_RIGHT, 0, &cfg, NULL, NULL) == 1);
+    cfg.click_mode = CORE_CLICK_OR;
+    core_analog_store(CORE_HAND_RIGHT, 0.1f, &cfg);
+    check("or: runtime 1 + miss -> 1; runtime 0 + miss -> 0",
+          core_click_synth(CORE_HAND_RIGHT, 1, &cfg, NULL, NULL) == 1 && core_click_synth(CORE_HAND_RIGHT, 0, &cfg, NULL, NULL) == 0);
+    cfg.click_mode = CORE_CLICK_AND;
+    check("and: runtime 1 + miss -> 0", core_click_synth(CORE_HAND_RIGHT, 1, &cfg, NULL, NULL) == 0);
+    core_analog_store(CORE_HAND_RIGHT, 0.4f, &cfg);
+    check("and: runtime 1 + hit -> 1; runtime 0 + hit -> 0",
+          core_click_synth(CORE_HAND_RIGHT, 1, &cfg, NULL, NULL) == 1 && core_click_synth(CORE_HAND_RIGHT, 0, &cfg, NULL, NULL) == 0);
+
+    /* detent + change gates fire once per transition */
+    check("detent 0->1 once", core_detent_note(mrc, 0) == 0 && core_detent_note(mrc, 1) == 1 && core_detent_note(mrc, 1) == 0);
+    check("detent 1->0 once", core_detent_note(mrc, 0) == 2 && core_detent_note(mrc, 0) == 0);
+    check("CLICKSYN change gate", core_click_changed(otc, 1) == 1 && core_click_changed(otc, 1) == 0 && core_click_changed(otc, 0) == 1);
+
+    /* role by name fallback, no bound path */
+    core_trigger_note_action(lone, XR_ACTION_TYPE_BOOLEAN_INPUT, "Foo_Right_Trigger_Pressed");
+    core_trigger_note_action(nm1, XR_ACTION_TYPE_FLOAT_INPUT, "foo_right_trigger_pull");
+    core_trigger_note_action(nm2, XR_ACTION_TYPE_BOOLEAN_INPUT, "grip_click");
+    check("name fallback: trigger+pressed -> click", core_action_role(lone, &hands, &method) == CORE_ROLE_CLICK && method == CORE_METHOD_NAME && hands == CORE_HAND_RIGHT);
+    check("name fallback: trigger+pull -> axis", core_action_role(nm1, NULL, &method) == CORE_ROLE_AXIS && method == CORE_METHOD_NAME);
+    check("name fallback: no trigger -> other", core_action_role(nm2, NULL, NULL) == CORE_ROLE_OTHER);
+
+    /* role cache stable even if bindings change later */
+    check("role stable on repeat", core_action_role(oax, NULL, NULL) == CORE_ROLE_AXIS && core_action_role(oax, NULL, NULL) == CORE_ROLE_AXIS);
+    core_trigger_mark_source_confirmed(oax, "/user/hand/right/input/squeeze/click");
+    check("cached role never changes after later binding info", core_action_role(oax, NULL, &method) == CORE_ROLE_AXIS && method == CORE_METHOD_SUGGESTED);
+
+    {
+      char line[512];
+      core_pair_format(CORE_HAND_RIGHT, line, sizeof(line));
+      printf("  %s\n", line);
+      check("PAIR right lists all analog and click actions",
+            strstr(line, "oculustouch_right_trigger_axis") && strstr(line, "mixedreality_right_trigger_axis") &&
+            strstr(line, "mixedreality_right_trigger_click") && strstr(line, "oculustouch_right_trigger_click"));
+      core_pair_format(CORE_HAND_LEFT, line, sizeof(line));
+      printf("  %s\n", line);
+      check("PAIR left is NONE", strstr(line, "analog_action=NONE") && strstr(line, "click_action=NONE"));
+      core_action_table_format(0, line, sizeof(line));
+      printf("  %s\n", line);
+      check("action table carries method and FLAG", strstr(line, "method=suggested") && strstr(line, "FLAG"));
+      core_action_role_format(0, line, sizeof(line));
+      printf("  %s\n", line);
+      check("ROLE line format", strstr(line, "role=click") && strstr(line, "method=suggested"));
+    }
+
+    /* click-only hand with confirmed binding */
+    core_trigger_reset_sources();
+    core_trigger_note_action(mrc, XR_ACTION_TYPE_BOOLEAN_INPUT, "mixedreality_right_trigger_click");
+    core_trigger_mark_source_confirmed(mrc, "/user/hand/right/input/trigger");
+    check("confirmed path wins as method=path", core_action_role(mrc, NULL, &method) == CORE_ROLE_CLICK && method == CORE_METHOD_PATH);
+    check("click-only hand passes through unmodified", core_click_synth(CORE_HAND_RIGHT, 1, &cfg, NULL, &have) == 1 && !have);
+    core_trigger_reset_sources();
+  }
+
   printf("%s (%d failure(s))\n", failures ? "OVERALL FAIL" : "OVERALL PASS", failures);
   return failures ? 1 : 0;
 }

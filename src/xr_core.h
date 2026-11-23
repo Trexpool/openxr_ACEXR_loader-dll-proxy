@@ -69,7 +69,23 @@ int core_trigger_value_action_count(int hand_flag);
 int core_trigger_target_excludes(XrAction action);
 #define CORE_QUERY_FIRST_CLICK 1
 #define CORE_QUERY_FIRST_UNMODIFIED 2
-int core_query_note(XrAction action, int modified);
+#define CORE_QUERY_CLICK_ALWAYS_ZERO 4
+int core_query_note(XrAction action, int modified, int runtime_nonzero);
+#define CORE_METHOD_PATH 1
+#define CORE_METHOD_SUGGESTED 2
+#define CORE_METHOD_NAME 3
+int core_action_role(XrAction action, int *hands, int *method);
+const char *core_role_name(int role);
+const char *core_role_method_name(int method);
+void core_analog_store(int hand, float raw, const CoreTriggerCfg *cfg);
+int core_analog_cached(int hand, float *analog, float *rawpull);
+int core_trigger_click_value(float compare, int runtime_click, const CoreTriggerCfg *cfg);
+int core_click_synth(int hand, int runtime_click, const CoreTriggerCfg *cfg, float *compare, int *have_analog);
+int core_click_warn_noanalog(XrAction action);
+int core_click_changed(XrAction action, int out);
+int core_detent_note(XrAction action, int runtime_click); /* 0 none, 1 rising, 2 falling */
+int core_pair_format(int hand, char *buf, size_t size);
+int core_action_role_format(int index, char *buf, size_t size);
 int core_action_table_count(void);
 int core_action_table_format(int index, char *buf, size_t size);
 void core_trigger_summary(char *buf, size_t size);

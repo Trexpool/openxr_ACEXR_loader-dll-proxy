@@ -51,3 +51,9 @@ Config keys (proxy config and API-layer config):
 - Exit summary: sample count, min, max, p99 of raw trigger.
 
 Hypothesis (unproven): with the old build and trigger_press_threshold=0.0 the Boolean was (value >= 0.0), always true, which may explain the earlier no-fire results.
+
+## Click matching, modes and comparison
+- The click action is identified by its COMPLETE bound path: /user/hand/{left,right}/input/trigger (UE4 legacy Oculus boolean) or .../input/trigger/click. Never .../trigger/value (axis) or .../trigger/touch. Runtime-confirmed sources (xrEnumerateBoundSourcesForAction) win over suggested bindings.
+- click_mode: replace (default) out = hit; or: out = runtime_click || hit; and: out = runtime_click && hit. Only active when trigger_click_threshold >= 0.
+- click_compare: rawpull (default) compares the value after deadzone and range normalization, before exponent and gain, so the threshold is a fraction of trigger pull independent of the animation curve; curved compares the curved, gained value.
+- BOOLDIG logs every boolean query; ACTION lines show type, bound paths (suggested ones marked) and role (axis/click/touch/other).

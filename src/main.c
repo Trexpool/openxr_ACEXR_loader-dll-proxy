@@ -120,6 +120,8 @@ double trigger_curve_exponent = 1.0;
 double trigger_gain = 1.0;
 double trigger_force_value = -1.0;
 double trigger_click_threshold = -1.0;
+int trigger_click_mode = CORE_CLICK_REPLACE;
+int trigger_click_compare = CORE_COMPARE_RAWPULL;
 double trigger_range_max = 1.0;
 char trigger_target_action[128] = "";
 volatile LONG action_dump_requested = 0;
@@ -236,6 +238,8 @@ static void proxy_trigger_cfg(CoreTriggerCfg *cfg)
   cfg->force_value = (float)trigger_force_value;
   cfg->range_max = (float)trigger_range_max;
   cfg->click_threshold = (float)trigger_click_threshold;
+  cfg->click_mode = trigger_click_mode;
+  cfg->click_compare = trigger_click_compare;
   core_trigger_cfg_sanitize(cfg);
 }
 
@@ -606,6 +610,22 @@ int read_config(char *config_file)
       continue;
     }
 
+    if (strcmp(cmd, "click_mode") == 0)
+    {
+      int m = core_click_mode_parse(value);
+      if (m >= 0)
+        trigger_click_mode = m;
+      continue;
+    }
+
+    if (strcmp(cmd, "click_compare") == 0)
+    {
+      int m = core_click_compare_parse(value);
+      if (m >= 0)
+        trigger_click_compare = m;
+      continue;
+    }
+
     if (strcmp(cmd, "trigger_range_max") == 0)
     {
       if (sscanf(value, "%lf", &double_temp) == 1 && double_temp > 0.0)
@@ -777,8 +797,12 @@ int write_config(const char *config_file)
     fprintf(arq, "trigger_gain=%f\n", trigger_gain);
     fprintf(arq, "# -1 = disabled. >=0 delivers exactly this analog value (bisect the game's fire threshold).\n");
     fprintf(arq, "trigger_force_value=%f\n", trigger_force_value);
-    fprintf(arq, "# -1 = use hardware click. 0-1 = synthesize click = (curved analog >= value).\n");
+    fprintf(arq, "# -1 = use hardware click. 0-1 = synthesize click (see click_mode / click_compare).\n");
     fprintf(arq, "trigger_click_threshold=%f\n", trigger_click_threshold);
+    fprintf(arq, "# replace: out = hit | or: out = runtime_click || hit | and: out = runtime_click && hit\n");
+    fprintf(arq, "click_mode=%s\n", core_click_mode_name(trigger_click_mode));
+    fprintf(arq, "# rawpull: compare after deadzone+range, before exponent/gain | curved: compare the curved+gain value\n");
+    fprintf(arq, "click_compare=%s\n", core_click_compare_name(trigger_click_compare));
     fprintf(arq, "trigger_range_max=%f\n", trigger_range_max);
     fprintf(arq, "trigger_target_action=%s\n", trigger_target_action);
     fprintf(arq, "capture_ads_apply_position=%d\n", capture_ads_apply_position ? 1 : 0);
@@ -1951,7 +1975,7 @@ XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateBoundSourcesForAction(
     {
       char path[XR_MAX_PATH_LENGTH];
       binding_path_to_string(diag_instance, sources[c], path, sizeof(path));
-      core_trigger_mark_source(enumerateInfo->action, path);
+      core_trigger_mark_source_confirmed(enumerateInfo->action, path);
     }
   }
   log_message("xrEnumerateBoundSourcesForAction action=%s count=%u", action_name_for_handle(enumerateInfo ? enumerateInfo->action : XR_NULL_HANDLE),
@@ -2131,6 +2155,8 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateBoolean(
   const char *method = "";
   int runtime_value = (ret == XR_SUCCESS && state) ? (int)state->currentState : 0;
   int modified = 0;
+  int is_click = 0;
+  float compare = 0.0f;
 
   if (ret == XR_SUCCESS && getInfo && state && _xrGetActionStateFloat &&
 	  proxy_trigger_match(getInfo->action, getInfo->subactionPath, 1, &method) &&
@@ -2179,12 +2205,10 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateBoolean(
 			trigger_state.isActive)
 		{
 		  float raw = trigger_state.currentState;
-		  int out = core_trigger_click(raw, &cfg);
-		  state->currentState = out;
+		  compare = core_trigger_click_compare(raw, &cfg);
+		  state->currentState = core_trigger_click(raw, runtime_value, &cfg);
 		  modified = 1;
-		  log_message("CLICK_DIAG method=source_path action=\"%s\" source=%s runtime=%d out=%d curved=%.6f threshold=%.6f",
-					  action_name_for_handle(getInfo->action), core_click_source_path(getInfo->action),
-					  runtime_value, out, core_trigger_curve(raw, &cfg), cfg.click_threshold);
+		  is_click = 1;
 		}
 	  }
 	}
@@ -2192,9 +2216,16 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateBoolean(
 
   if (ret == XR_SUCCESS && getInfo && state)
   {
+	CoreTriggerCfg cfg;
+	const char *bound = core_click_source_path(getInfo->action);
+	proxy_trigger_cfg(&cfg);
+	if (bound[0] == '<')
+	  bound = core_trigger_source_path(getInfo->action);
 	proxy_note_query(getInfo->action, modified, "boolean");
-	log_message("xrGetActionStateBoolean action=%s runtime=%d out=%d modified=%d",
-				action_name_for_handle(getInfo->action), runtime_value, (int)state->currentState, modified);
+	log_message("BOOLDIG action=\"%s\" bound=\"%s\" runtime=%d out=%d mode=%s threshold=%.6f compare=%.6f compare_kind=%s",
+				action_name_for_handle(getInfo->action), bound, runtime_value, (int)state->currentState,
+				core_click_mode_name(cfg.click_mode), cfg.click_threshold, compare,
+				is_click ? core_click_compare_name(cfg.click_compare) : "not-click");
   }
   return ret;
 }

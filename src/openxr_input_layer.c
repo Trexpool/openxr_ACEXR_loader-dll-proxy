@@ -370,6 +370,18 @@ static void load_layer_config(void)
 	  continue;
 	}
 
+	if (strcmp(command, "click_mode") == 0 && core_click_mode_parse(value) >= 0)
+	{
+	  config.trigger.click_mode = core_click_mode_parse(value);
+	  continue;
+	}
+
+	if (strcmp(command, "click_compare") == 0 && core_click_compare_parse(value) >= 0)
+	{
+	  config.trigger.click_compare = core_click_compare_parse(value);
+	  continue;
+	}
+
 	if (strcmp(command, "trigger_range_max") == 0 && sscanf(value, "%lf", &number) == 1)
 	{
 	  if (number > 0.0)
@@ -846,7 +858,7 @@ static XrResult XRAPI_CALL layer_enumerate_sources(
 	{
 	  char path[XR_MAX_PATH_LENGTH];
 	  binding_path_to_string(layer_instance, sources[i], path, sizeof(path));
-	  core_trigger_mark_source(info->action, path);
+	  core_trigger_mark_source_confirmed(info->action, path);
 	}
   }
   return result;
@@ -891,6 +903,8 @@ static XrResult XRAPI_CALL layer_get_action_state_boolean(
   XrBool32 original_state = state ? state->currentState : XR_FALSE;
   const char *method = "";
   int modified = 0;
+  int is_click = 0;
+  float compare = 0.0f;
 
   load_layer_config();
   if (getInfo && state)
@@ -941,20 +955,28 @@ static XrResult XRAPI_CALL layer_get_action_state_boolean(
 		{
 		  char message[768];
 		  float raw = trigger_state.currentState;
-		  int out = core_trigger_click(raw, &config.trigger);
-		  state->currentState = out;
+		  compare = core_trigger_click_compare(raw, &config.trigger);
+		  state->currentState = core_trigger_click(raw, (int)original_state, &config.trigger);
 		  modified = 1;
-		  snprintf(message, sizeof(message),
-				   "CLICK_DIAG method=source_path action=\"%s\" source=%s runtime=%d out=%d curved=%.6f threshold=%.6f",
-				   action_name(getInfo->action), core_click_source_path(getInfo->action),
-				   (int)original_state, out, core_trigger_curve(raw, &config.trigger),
-				   config.trigger.click_threshold);
-		  layer_log(message);
+		  is_click = 1;
+		  (void)message;
 		}
 	  }
 	}
 
 	layer_note_query(getInfo->action, modified, "boolean");
+	{
+	  char message[768];
+	  const char *bound = core_click_source_path(getInfo->action);
+	  if (bound[0] == '<')
+		bound = core_trigger_source_path(getInfo->action);
+	  snprintf(message, sizeof(message),
+			   "BOOLDIG action=\"%s\" bound=\"%s\" runtime=%d out=%d mode=%s threshold=%.6f compare=%.6f compare_kind=%s",
+			   action_name(getInfo->action), bound, (int)original_state, (int)state->currentState,
+			   core_click_mode_name(config.trigger.click_mode), config.trigger.click_threshold, compare,
+			   is_click ? core_click_compare_name(config.trigger.click_compare) : "not-click");
+	  layer_log(message);
+	}
 	{
 	  char message[512];
 	  snprintf(message, sizeof(message),

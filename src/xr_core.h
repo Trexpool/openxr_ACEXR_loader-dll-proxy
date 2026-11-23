@@ -21,10 +21,31 @@ typedef struct
   float gain;            /* [0, 100], default 1, analog path only */
   float force_value;     /* -1 = disabled; >=0 delivers exactly this constant (clamped [0,1]) */
   float range_max;       /* (0,1], default 1; raw is divided by this before deadzone/exponent */
-  float click_threshold; /* -1 = pass hardware click through; >=0 synthesize click = curved >= t */
+  float click_threshold; /* -1 = pass hardware click through; >=0 synthesize click */
+  int click_mode;        /* CORE_CLICK_REPLACE | OR | AND */
+  int click_compare;     /* CORE_COMPARE_RAWPULL (after deadzone+range, before exponent/gain) | CURVED (after gain) */
 } CoreTriggerCfg;
+#define CORE_CLICK_REPLACE 0 /* out = hit */
+#define CORE_CLICK_OR 1      /* out = runtime || hit */
+#define CORE_CLICK_AND 2     /* out = runtime && hit */
+#define CORE_COMPARE_RAWPULL 0
+#define CORE_COMPARE_CURVED 1
+#define CORE_ROLE_OTHER 0
+#define CORE_ROLE_AXIS 1
+#define CORE_ROLE_CLICK 2
+#define CORE_ROLE_TOUCH 3
+int core_trigger_classify_path(const char *path, int *hand_flag);
+int core_trigger_path_matches(const char *path, int role, int hand_flag);
+float core_trigger_pull(float v, const CoreTriggerCfg *cfg);
+float core_trigger_click_compare(float raw, const CoreTriggerCfg *cfg);
+int core_click_mode_parse(const char *s);
+const char *core_click_mode_name(int mode);
+int core_click_compare_parse(const char *s);
+const char *core_click_compare_name(int compare);
+void core_trigger_mark_source_confirmed(XrAction action, const char *source_path);
+int core_click_source_confirmed(XrAction action);
 int core_trigger_click_enabled(const CoreTriggerCfg *cfg);
-int core_trigger_click(float raw, const CoreTriggerCfg *cfg);
+int core_trigger_click(float raw, int runtime_click, const CoreTriggerCfg *cfg);
 
 void core_trigger_cfg_defaults(CoreTriggerCfg *cfg);
 void core_trigger_cfg_sanitize(CoreTriggerCfg *cfg);

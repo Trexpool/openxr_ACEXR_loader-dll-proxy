@@ -3,6 +3,7 @@
 #include "xr_core.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -199,17 +200,132 @@ int main(void)
 
     core_trigger_cfg_defaults(&f);
     check("click threshold default is passthrough (-1, disabled)", !core_trigger_click_enabled(&f));
+    check("click passthrough: runtime 0 -> 0, 1 -> 1 for any raw",
+          core_trigger_click(0.9f, 0, &f) == 0 && core_trigger_click(0.0f, 1, &f) == 1);
+    check("click defaults: mode replace, compare rawpull",
+          f.click_mode == CORE_CLICK_REPLACE && f.click_compare == CORE_COMPARE_RAWPULL);
     f.click_threshold = 0.0f;
-    check("click synth threshold 0.0: raw 0.0 -> click 1", core_trigger_click(0.0f, &f) == 1);
+    check("click synth threshold 0.0: raw 0.0 -> click 1", core_trigger_click(0.0f, 0, &f) == 1);
     f.click_threshold = 0.5f;
     check("click synth threshold 0.5: raw 0.49 -> 0, raw 0.5 -> 1",
-          core_trigger_click(0.49f, &f) == 0 && core_trigger_click(0.5f, &f) == 1);
+          core_trigger_click(0.49f, 0, &f) == 0 && core_trigger_click(0.5f, 0, &f) == 1);
     f.click_threshold = 1.0f;
     check("click synth threshold 1.0: raw 0.99 -> 0, raw 1.0 -> 1",
-          core_trigger_click(0.99f, &f) == 0 && core_trigger_click(1.0f, &f) == 1);
-    f.click_threshold = 0.5f;
+          core_trigger_click(0.99f, 0, &f) == 0 && core_trigger_click(1.0f, 0, &f) == 1);
+
+    /* click_mode replace/or/and at thresholds 0.0, 0.5, 1.0, runtime click 0 and 1 */
+    {
+      static const float th[3] = {0.0f, 0.5f, 1.0f};
+      static const float rawv[2] = {0.25f, 1.0f};
+      int ok_replace = 1, ok_or = 1, ok_and = 1;
+      for (int t = 0; t < 3; ++t)
+        for (int r = 0; r < 2; ++r)
+          for (int rt = 0; rt < 2; ++rt)
+          {
+            int hit;
+            core_trigger_cfg_defaults(&f);
+            f.click_threshold = th[t];
+            hit = rawv[r] >= th[t];
+            f.click_mode = CORE_CLICK_REPLACE;
+            if (core_trigger_click(rawv[r], rt, &f) != hit) ok_replace = 0;
+            f.click_mode = CORE_CLICK_OR;
+            if (core_trigger_click(rawv[r], rt, &f) != (rt || hit)) ok_or = 0;
+            f.click_mode = CORE_CLICK_AND;
+            if (core_trigger_click(rawv[r], rt, &f) != (rt && hit)) ok_and = 0;
+          }
+      check("click_mode replace ignores runtime (thresholds 0/0.5/1, runtime 0/1)", ok_replace);
+      check("click_mode or = runtime || hit (thresholds 0/0.5/1, runtime 0/1)", ok_or);
+      check("click_mode and = runtime && hit (thresholds 0/0.5/1, runtime 0/1)", ok_and);
+    }
+
+    /* click_compare: rawpull vs curved with exponent 2.0 */
+    core_trigger_cfg_defaults(&f);
     f.exponent = 2.0f;
-    check("click uses curved value: raw 0.25 exp 2 -> curved 0.5 -> click 1", core_trigger_click(0.25f, &f) == 1);
+    f.click_threshold = 0.25f;
+    f.click_compare = CORE_COMPARE_RAWPULL;
+    check("rawpull exp 2 thr 0.25: fires at raw 0.25", core_trigger_click(0.25f, 0, &f) == 1);
+    check("rawpull exp 2 thr 0.25: does NOT fire at raw 0.0625", core_trigger_click(0.0625f, 0, &f) == 0);
+    f.click_compare = CORE_COMPARE_CURVED;
+    check("curved exp 2 thr 0.25: fires at raw 0.0625", core_trigger_click(0.0625f, 0, &f) == 1);
+    check("curved exp 2 thr 0.25: raw 0.05 does not fire", core_trigger_click(0.05f, 0, &f) == 0);
+    core_trigger_cfg_defaults(&f);
+    f.deadzone = 0.2f;
+    f.exponent = 2.0f;
+    f.gain = 3.0f;
+    f.click_threshold = 0.5f;
+    check("rawpull uses deadzone but not exponent/gain: raw 0.6 -> pull 0.5",
+          near(core_trigger_click_compare(0.6f, &f), 0.5f) && core_trigger_click(0.6f, 0, &f) == 1 &&
+          core_trigger_click(0.59f, 0, &f) == 0);
+    check("click mode/compare name parsing",
+          core_click_mode_parse("or") == CORE_CLICK_OR && core_click_mode_parse("bogus") < 0 &&
+          core_click_compare_parse("curved") == CORE_COMPARE_CURVED && core_click_compare_parse("x") < 0);
+  }
+
+  /* path matching: COMPLETE paths, never a loose suffix */
+  {
+    const char *R = "/user/hand/right", *Lh = "/user/hand/left";
+    char p[96];
+    int ok;
+    snprintf(p, sizeof(p), "%s/input/trigger", R);
+    check("path .../right/input/trigger matches as CLICK", core_trigger_path_matches(p, CORE_ROLE_CLICK, CORE_HAND_RIGHT));
+    check("path .../right/input/trigger is not AXIS", !core_trigger_path_matches(p, CORE_ROLE_AXIS, CORE_HAND_RIGHT));
+    snprintf(p, sizeof(p), "%s/input/trigger/click", R);
+    check("path .../right/input/trigger/click matches as CLICK", core_trigger_path_matches(p, CORE_ROLE_CLICK, CORE_HAND_RIGHT));
+    snprintf(p, sizeof(p), "%s/input/trigger/value", R);
+    check("path .../right/input/trigger/value matches as AXIS", core_trigger_path_matches(p, CORE_ROLE_AXIS, CORE_HAND_RIGHT));
+    check("path .../right/input/trigger/value NEVER matches as CLICK", !core_trigger_path_matches(p, CORE_ROLE_CLICK, CORE_HAND_RIGHT));
+    snprintf(p, sizeof(p), "%s/input/trigger/touch", R);
+    check("path .../right/input/trigger/touch does NOT match as CLICK", !core_trigger_path_matches(p, CORE_ROLE_CLICK, CORE_HAND_RIGHT));
+    check("path .../right/input/trigger/touch is TOUCH", core_trigger_path_matches(p, CORE_ROLE_TOUCH, CORE_HAND_RIGHT));
+    ok = 1;
+    {
+      static const char *suffixes[] = {"/input/trigger", "/input/trigger/click", "/input/trigger/value", "/input/trigger/touch"};
+      static const int roles[] = {CORE_ROLE_CLICK, CORE_ROLE_CLICK, CORE_ROLE_AXIS, CORE_ROLE_TOUCH};
+      for (int i = 0; i < 4; ++i)
+      {
+        snprintf(p, sizeof(p), "%s%s", Lh, suffixes[i]);
+        if (core_trigger_path_matches(p, roles[i], CORE_HAND_RIGHT)) ok = 0;
+        if (!core_trigger_path_matches(p, roles[i], CORE_HAND_LEFT)) ok = 0;
+      }
+    }
+    check("LEFT-hand variants never match a right-hand action (and match left)", ok);
+    check("loose paths do not match: .../trigger/valuex, .../triggerx, .../trigger/click/x",
+          core_trigger_classify_path("/user/hand/right/input/trigger/valuex", NULL) == CORE_ROLE_OTHER &&
+          core_trigger_classify_path("/user/hand/right/input/triggerx", NULL) == CORE_ROLE_OTHER &&
+          core_trigger_classify_path("/user/hand/right/input/trigger/click/x", NULL) == CORE_ROLE_OTHER &&
+          core_trigger_classify_path("/user/hand/rightx/input/trigger", NULL) == CORE_ROLE_OTHER);
+  }
+
+  /* the three actions from the in-game log; axis is never the click; runtime-confirmed wins */
+  {
+    XrAction cl = (XrAction)(uintptr_t)101, ax = (XrAction)(uintptr_t)102, tc = (XrAction)(uintptr_t)103;
+    core_trigger_reset_sources();
+    core_trigger_note_action(cl, XR_ACTION_TYPE_BOOLEAN_INPUT, "oculustouch_right_trigger_click");
+    core_trigger_note_action(ax, XR_ACTION_TYPE_FLOAT_INPUT, "oculustouch_right_trigger_axis");
+    core_trigger_note_action(tc, XR_ACTION_TYPE_BOOLEAN_INPUT, "oculustouch_right_trigger_touch");
+    core_trigger_mark_source(cl, "/user/hand/right/input/trigger");
+    core_trigger_mark_source(ax, "/user/hand/right/input/trigger/value");
+    core_trigger_mark_source(tc, "/user/hand/right/input/trigger/touch");
+    check("UE4 legacy bool action is click for the right hand", core_trigger_click_flags(cl) == CORE_HAND_RIGHT);
+    check("analog axis action is never treated as the click", core_trigger_click_flags(ax) == 0);
+    check("touch action is neither click nor axis", core_trigger_click_flags(tc) == 0 && core_trigger_hand_flags(tc) == 0);
+    check("axis action is found as the float trigger", core_trigger_find_float_action(CORE_HAND_RIGHT) == ax);
+    check("click action is not the axis", core_trigger_hand_flags(cl) == 0);
+    core_trigger_mark_source_confirmed(cl, "/user/hand/right/input/squeeze/click");
+    check("runtime-confirmed binding overrides the suggested one (no longer a click)", core_trigger_click_flags(cl) == 0);
+    core_trigger_mark_source_confirmed(cl, "/user/hand/right/input/trigger");
+    check("runtime-confirmed trigger path is a click again", core_trigger_click_flags(cl) == CORE_HAND_RIGHT && core_click_source_confirmed(cl));
+    {
+      char line[512];
+      int okfmt = core_action_table_format(0, line, sizeof(line));
+      printf("  %s\n", line);
+      check("action table shows type/bound/role", okfmt && strstr(line, "type=bool") && strstr(line, "role=click") && strstr(line, "bound=["));
+      core_trigger_note_action((XrAction)(uintptr_t)104, XR_ACTION_TYPE_BOOLEAN_INPUT, "orphan");
+      okfmt = core_action_table_format(3, line, sizeof(line));
+      printf("  %s\n", line);
+      check("unresolved action says UNRESOLVED", okfmt && strstr(line, "UNRESOLVED"));
+    }
+    core_trigger_reset_sources();
   }
 
   printf("%s (%d failure(s))\n", failures ? "OVERALL FAIL" : "OVERALL PASS", failures);

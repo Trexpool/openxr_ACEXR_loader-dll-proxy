@@ -423,6 +423,7 @@ static int log_pid;
 static int log_seq;
 static int log_rotating;
 char log_path[MAX_PATH];
+static char log_dir[MAX_PATH];
 
 static void log_rotate(void)
 {
@@ -433,13 +434,13 @@ static void log_rotate(void)
   fclose(h_log);
   h_log = 0;
   ++log_seq;
-  snprintf(bak, sizeof(bak), "log_%d_%d.txt.bak", log_pid, log_seq);
+  snprintf(bak, sizeof(bak), "%slog_%d_%d.txt.bak", log_dir, log_pid, log_seq);
   remove(bak);
   rename(log_path, bak);
   if (log_seq > LOG_KEEP_BAK)
   {
     char old[MAX_PATH + 32];
-    snprintf(old, sizeof(old), "log_%d_%d.txt.bak", log_pid, log_seq - LOG_KEEP_BAK);
+    snprintf(old, sizeof(old), "%slog_%d_%d.txt.bak", log_dir, log_pid, log_seq - LOG_KEEP_BAK);
     remove(old);
   }
   h_log = fopen(log_path, "a");
@@ -1030,6 +1031,9 @@ int log_init()
     char full[MAX_PATH];
     if (!_fullpath(full, log_path, sizeof(full)))
       snprintf(full, sizeof(full), "%s", log_path);
+    snprintf(log_path, sizeof(log_path), "%s", full);
+    snprintf(log_dir, sizeof(log_dir), "%s", full);
+    { char *sl = strrchr(log_dir, '\\'); if (sl) sl[1] = 0; else log_dir[0] = 0; }
     log_message("LOG path=%s cap=%ld bytes binding_log=%d", full, (long)LOG_CAP_BYTES, binding_logging_enabled);
   }
   return 1;
@@ -2142,11 +2146,30 @@ XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateViewConfigurations(
   return _xrEnumerateViewConfigurations(instance, systemId, viewConfigurationTypeCapacityInput, viewConfigurationTypeCountOutput, viewConfigurationTypes);
 }
 
+static int proxy_hand_of(XrPath sub, int hands)
+{
+  if ((hands & CORE_HAND_RIGHT) && (sub == id_user_hand_right || (sub == XR_NULL_PATH && hands == CORE_HAND_RIGHT)))
+    return CORE_HAND_RIGHT;
+  if ((hands & CORE_HAND_LEFT) && (sub == id_user_hand_left || (sub == XR_NULL_PATH && hands == CORE_HAND_LEFT)))
+    return CORE_HAND_LEFT;
+  return 0;
+}
+
+static void proxy_action_table_path(char *out, size_t size, int next_to_config)
+{
+  char tmp[MAX_PATH];
+  char *sl;
+  snprintf(tmp, sizeof(tmp), "%s", next_to_config ? config_file_path : log_path);
+  sl = strrchr(tmp, '\\');
+  if (sl) sl[1] = 0; else tmp[0] = 0;
+  snprintf(out, size, "%saction_table.txt", tmp);
+}
+
 static int proxy_hand_match(XrPath sub, int hands)
 {
-  if (!(hands & CORE_HAND_RIGHT))
+  if (!hands)
 	return 0;
-  return sub == id_user_hand_right || (sub == XR_NULL_PATH && hands == CORE_HAND_RIGHT);
+  return proxy_hand_of(sub, hands) != 0;
 }
 
 static int proxy_trigger_match(XrAction action, XrPath sub, int want_bool, const char **method)
@@ -2186,8 +2209,15 @@ static int log_changed(XrAction action, float a, float b, int c)
 static void proxy_dump_action_table(const char *why)
 {
   char line[2048];
-  FILE *tf = fopen("action_table.txt", "w");
-  log_message("ACTION_TABLE dump reason=%s count=%d file=action_table.txt", why, core_action_table_count());
+  char p1[MAX_PATH + 32], p2[MAX_PATH + 32];
+  FILE *tf, *tf2;
+  proxy_action_table_path(p1, sizeof(p1), 0);
+  proxy_action_table_path(p2, sizeof(p2), 1);
+  tf = fopen(p1, "w");
+  tf2 = strcmp(p1, p2) ? fopen(p2, "w") : NULL;
+  log_message("ACTION_TABLE path=%s", p1);
+  log_message("ACTION_TABLE copy=%s", p2);
+  log_message("ACTION_TABLE dump reason=%s count=%d open=%d", why, core_action_table_count(), tf != NULL);
   for (int c = 0; c < core_action_table_count(); c++)
   {
 	if (core_action_table_format(c, line, sizeof(line)))
@@ -2195,12 +2225,16 @@ static void proxy_dump_action_table(const char *why)
 	  log_message("%s", line);
 	  if (tf)
 		fprintf(tf, "%s\n", line);
+  if (tf2)
+fprintf(tf2, "%s\n", line);
 	}
 	if (core_action_role_format(c, line, sizeof(line)))
 	  log_message("%s", line);
   }
   if (tf)
 	fclose(tf);
+  if (tf2)
+fclose(tf2);
   core_pair_format(CORE_HAND_RIGHT, line, sizeof(line));
   log_message("%s", line);
   core_pair_format(CORE_HAND_LEFT, line, sizeof(line));
@@ -2221,6 +2255,8 @@ static void proxy_note_query(XrAction action, int modified, const char *kind, in
   if (r & CORE_QUERY_FIRST_CLICK)
 	log_message("*** GAME QUERIES TRIGGER CLICK ACTION: action=\"%s\" source=%s (%s) ***",
 				action_name_for_handle(action), core_click_source_path(action), kind);
+  if (r & CORE_QUERY_UNBOUND_UNMODIFIED)
+log_message("INFO ANALOG-ROLE ACTION NOT BOUND BY RUNTIME: action=\"%s\" source=%s - not the active interaction profile, correctly untouched", action_name_for_handle(action), core_trigger_source_path(action));
   if (r & CORE_QUERY_FIRST_UNMODIFIED)
 	log_message("*** BUG: ANALOG-ROLE ACTION NOT MODIFIED: action=\"%s\" source=%s (%s) ***",
 				action_name_for_handle(action), core_trigger_source_path(action), kind);
@@ -2229,14 +2265,24 @@ static void proxy_note_query(XrAction action, int modified, const char *kind, in
 				action_name_for_handle(action));
 }
 
-static void proxy_trigger_diag(const char *method, XrAction action, float raw, const CoreTriggerCfg *cfg)
+static void proxy_firepath_tick(const CoreTriggerCfg *cfg)
+{
+  char line[768];
+  if (!core_fire_due((unsigned long long)GetTickCount64()))
+return;
+  for (int h = CORE_HAND_RIGHT; h <= CORE_HAND_LEFT; ++h)
+if (core_fire_format(h, cfg, line, sizeof(line)))
+  log_message("%s", line);
+}
+
+static void proxy_trigger_diag(const char *method, XrAction action, float raw, const CoreTriggerCfg *cfg, int hand)
 {
   float curved = core_trigger_curve(raw, cfg);
   int pressed = core_trigger_pressed(raw, cfg);
   if (core_trigger_log_gate(raw, curved, pressed, (unsigned long long)GetTickCount64()))
   {
 	char line[768];
-	core_trigger_format_diag(line, sizeof(line), method, action_name_for_handle(action), action, "right",
+	core_trigger_format_diag(line, sizeof(line), method, action_name_for_handle(action), action, hand == CORE_HAND_LEFT ? "left" : "right",
 							 raw, curved, core_trigger_output(raw, cfg), pressed, cfg);
 	log_message("%s", line);
   }
@@ -2260,7 +2306,7 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateBoolean(
 	  !core_trigger_target_excludes(getInfo->action))
   {
 	XrAction trigger_action = core_trigger_sources_known()
-								  ? core_trigger_find_float_action(CORE_HAND_RIGHT)
+								  ? core_trigger_find_float_action(proxy_hand_of(getInfo->subactionPath, 3) ? proxy_hand_of(getInfo->subactionPath, 3) : CORE_HAND_RIGHT)
 								  : action_handle_for_name("trigger");
 	if (trigger_action != XR_NULL_HANDLE)
 	{
@@ -2279,7 +2325,7 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateBoolean(
 		state->currentState = core_trigger_pressed(trigger_state.currentState, &cfg);
 		state->changedSinceLastSync = trigger_state.changedSinceLastSync;
 		state->lastChangeTime = trigger_state.lastChangeTime;
-		proxy_trigger_diag(method, trigger_action, trigger_state.currentState, &cfg);
+		proxy_trigger_diag(method, trigger_action, trigger_state.currentState, &cfg, proxy_hand_of(getInfo->subactionPath, 3) ? proxy_hand_of(getInfo->subactionPath, 3) : CORE_HAND_RIGHT);
 		modified = 1;
 	  }
 	}
@@ -2288,25 +2334,30 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateBoolean(
 		   proxy_click_match(getInfo->action, getInfo->subactionPath))
   {
 	CoreTriggerCfg cfg;
-	int have = 0, det;
+	int have = 0, det, ch = CORE_HAND_RIGHT, chands = 0;
+const char *hn;
 	float araw = 0.0f, aout = 0.0f;
 	proxy_trigger_cfg(&cfg);
 	is_click = 1;
 	det = core_detent_note(getInfo->action, runtime_value);
-	core_analog_cached(CORE_HAND_RIGHT, &aout, &araw);
+	core_action_role(getInfo->action, &chands, NULL);
+ch = proxy_hand_of(getInfo->subactionPath, chands) ? proxy_hand_of(getInfo->subactionPath, chands) : CORE_HAND_RIGHT;
+hn = ch == CORE_HAND_LEFT ? "left" : "right";
+core_analog_cached(ch, &aout, &araw);
 	if (det)
-	  log_message("DETENT hand=right action=\"%s\" runtime_click %d -> %d analog_cached=%.6f analog_rawpull_cached=%.6f",
-				  action_name_for_handle(getInfo->action), det == 1 ? 0 : 1, det == 1 ? 1 : 0, aout, araw);
-	state->currentState = core_click_synth(CORE_HAND_RIGHT, runtime_value, &cfg, &compare, &have);
+	  log_message("DETENT hand=%s action=\"%s\" runtime_click %d -> %d analog_cached=%.6f analog_rawpull_cached=%.6f",
+				  hn, action_name_for_handle(getInfo->action), det == 1 ? 0 : 1, det == 1 ? 1 : 0, aout, araw);
+	state->currentState = core_click_synth(ch, runtime_value, &cfg, &compare, &have);
+core_fire_note_click(ch, getInfo->action, runtime_value, (int)state->currentState, compare);
 	if (!have && core_click_warn_noanalog(getInfo->action))
-	  log_message("WARNING click action=\"%s\" has no analog value cached yet for hand=right; analog treated as 0.0, click passes through",
-				  action_name_for_handle(getInfo->action));
+	  log_message("WARNING click action=\"%s\" has no analog value cached yet for hand=%s; analog treated as 0.0, click passes through",
+				  action_name_for_handle(getInfo->action), hn);
 	if (core_trigger_click_enabled(&cfg))
 	{
 	  modified = 1;
 	  if (core_click_changed(getInfo->action, (int)state->currentState))
-		log_message("CLICKSYN action=\"%s\" hand=right runtime=%d out=%d mode=%s compare=%.6f compare_kind=%s threshold=%.6f analog_cached=%.6f analog_rawpull_cached=%.6f",
-					action_name_for_handle(getInfo->action), runtime_value, (int)state->currentState,
+		log_message("CLICKSYN action=\"%s\" hand=%s runtime=%d out=%d mode=%s compare=%.6f compare_kind=%s threshold=%.6f analog_cached=%.6f analog_rawpull_cached=%.6f",
+					action_name_for_handle(getInfo->action), hn, runtime_value, (int)state->currentState,
 					core_click_mode_name(cfg.click_mode), compare, core_click_compare_name(cfg.click_compare),
 					cfg.click_threshold, aout, araw);
 	}
@@ -2351,9 +2402,25 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateFloat(
 	if (core_trigger_method_first_use(strcmp(method, "source_path") == 0))
 	  log_message("TRIGGER identification method: %s", method);
 	state->currentState = core_trigger_output(raw, &cfg);
-	core_analog_store(CORE_HAND_RIGHT, raw, &cfg);
+	int fhands = 0;
+core_action_role(getInfo->action, &fhands, NULL);
+int fh = proxy_hand_of(getInfo->subactionPath, fhands) ? proxy_hand_of(getInfo->subactionPath, fhands) : CORE_HAND_RIGHT;
+int wr = core_analog_write(fh, getInfo->action, raw, &cfg);
+if (wr & CORE_WRITE_NEWWRITER)
+{
+  float ca = 0.0f, cr = 0.0f;
+  unsigned nchg = 0;
+  core_analog_cached(fh, &ca, &cr);
+  core_analog_writer(fh, &nchg);
+  log_message("CACHEWRITE hand=%s action=\"%s\" bound=%s rawpull=%.6f analog=%.6f writer_changes=%u", fh == CORE_HAND_LEFT ? "left" : "right", action_name_for_handle(getInfo->action), core_action_bound(getInfo->action) ? "yes" : "no", cr, ca, nchg);
+}
+if (wr & CORE_WRITE_INCONSISTENT)
+  log_message("WARNING analog cache inconsistent with curve identity: action=\"%s\"", action_name_for_handle(getInfo->action));
+if (wr)
+  core_fire_note_axis(fh, getInfo->action, state->currentState);
 	core_trigger_track(raw, state->currentState);
-	proxy_trigger_diag(method, getInfo->action, raw, &cfg);
+	proxy_trigger_diag(method, getInfo->action, raw, &cfg, fh);
+proxy_firepath_tick(&cfg);
 	modified = 1;
   }
   if (ret == XR_SUCCESS && getInfo && state)

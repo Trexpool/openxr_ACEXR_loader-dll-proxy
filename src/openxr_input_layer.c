@@ -136,12 +136,29 @@ static int layer_binding_log = 1;
 static long layer_log_bytes;
 static int layer_log_seq;
 
+static char layer_log_full[MAX_PATH];
+
+static const char *layer_log_file(void)
+{
+  if (!layer_log_full[0] && !_fullpath(layer_log_full, "openxr_api_layer.log", sizeof(layer_log_full)))
+    snprintf(layer_log_full, sizeof(layer_log_full), "%s", "openxr_api_layer.log");
+  return layer_log_full;
+}
+
+static void layer_dir_of(const char *path, char *out, size_t size)
+{
+  char *sl;
+  snprintf(out, size, "%s", path);
+  sl = strrchr(out, '\\');
+  if (sl) sl[1] = 0; else out[0] = 0;
+}
+
 static void layer_log(const char *text)
 {
   FILE *file;
   if (layer_log_bytes == 0)
   {
-	file = fopen("openxr_api_layer.log", "rb");
+	file = fopen(layer_log_file(), "rb");
 	if (file)
 	{
 	  fseek(file, 0, SEEK_END);
@@ -156,7 +173,7 @@ static void layer_log(const char *text)
 	++layer_log_seq;
 	snprintf(bak, sizeof(bak), "log_%lu_%d.txt.bak", (unsigned long)GetCurrentProcessId(), layer_log_seq);
 	remove(bak);
-	rename("openxr_api_layer.log", bak);
+	rename(layer_log_file(), bak);
 	if (layer_log_seq > 3)
 	{
 	  snprintf(old, sizeof(old), "log_%lu_%d.txt.bak", (unsigned long)GetCurrentProcessId(), layer_log_seq - 3);
@@ -165,7 +182,7 @@ static void layer_log(const char *text)
 	layer_log_bytes = 0;
   }
   layer_log_bytes += (long)strlen(text) + 1;
-  file = fopen("openxr_api_layer.log", "a");
+  file = fopen(layer_log_file(), "a");
   if (file)
   {
 	fprintf(file, "%s\n", text);
@@ -856,11 +873,20 @@ static XrResult XRAPI_CALL layer_suggest_bindings(
   return result;
 }
 
+static int layer_hand_of(XrPath sub, int hands)
+{
+  if ((hands & CORE_HAND_RIGHT) && (sub == right_hand_path || (sub == XR_NULL_PATH && hands == CORE_HAND_RIGHT)))
+    return CORE_HAND_RIGHT;
+  if ((hands & CORE_HAND_LEFT) && left_hand_path != XR_NULL_PATH && (sub == left_hand_path || (sub == XR_NULL_PATH && hands == CORE_HAND_LEFT)))
+    return CORE_HAND_LEFT;
+  return 0;
+}
+
 static int layer_hand_match(XrPath sub, int hands)
 {
-  if (!(hands & CORE_HAND_RIGHT))
+  if (!hands)
 	return 0;
-  return sub == right_hand_path || (sub == XR_NULL_PATH && hands == CORE_HAND_RIGHT);
+  return layer_hand_of(sub, hands) != 0;
 }
 
 static int layer_trigger_match(XrAction action, XrPath sub, int want_bool, const char **method)
@@ -886,8 +912,19 @@ static void layer_dump_action_table(const char *why)
 {
   char line[2048];
   char head[160];
-  FILE *tf = fopen("action_table.txt", "w");
-  snprintf(head, sizeof(head), "ACTION_TABLE dump reason=%s count=%d file=action_table.txt cap=5242880", why, core_action_table_count());
+  char p1[MAX_PATH + 32], p2[MAX_PATH + 32], pm[MAX_PATH + 64];
+  FILE *tf, *tf2 = NULL;
+  layer_dir_of(layer_log_file(), p1, sizeof(p1));
+  strcat(p1, "action_table.txt");
+  layer_dir_of(config_path, p2, sizeof(p2));
+  strcat(p2, "action_table.txt");
+  tf = fopen(p1, "w");
+  if (strcmp(p1, p2)) tf2 = fopen(p2, "w");
+  snprintf(pm, sizeof(pm), "ACTION_TABLE path=%s", p1);
+  layer_log(pm);
+  snprintf(pm, sizeof(pm), "ACTION_TABLE copy=%s", p2);
+  layer_log(pm);
+  snprintf(head, sizeof(head), "ACTION_TABLE dump reason=%s count=%d cap=5242880", why, core_action_table_count());
   layer_log(head);
   for (int i = 0; i < core_action_table_count(); ++i)
   {
@@ -896,12 +933,16 @@ static void layer_dump_action_table(const char *why)
 	  layer_log(line);
 	  if (tf)
 		fprintf(tf, "%s\n", line);
+  if (tf2)
+fprintf(tf2, "%s\n", line);
 	}
 	if (core_action_role_format(i, line, sizeof(line)))
 	  layer_log(line);
   }
   if (tf)
 	fclose(tf);
+  if (tf2)
+fclose(tf2);
   core_pair_format(CORE_HAND_RIGHT, line, sizeof(line));
   layer_log(line);
   core_pair_format(CORE_HAND_LEFT, line, sizeof(line));
@@ -918,6 +959,11 @@ static void layer_note_query(XrAction action, int modified, const char *kind, in
 			 "*** GAME QUERIES TRIGGER CLICK ACTION: action=\"%s\" source=%s (%s) ***",
 			 action_name(action), core_click_source_path(action), kind);
 	layer_log(message);
+  }
+  if (r & CORE_QUERY_UNBOUND_UNMODIFIED)
+  {
+snprintf(message, sizeof(message), "INFO ANALOG-ROLE ACTION NOT BOUND BY RUNTIME: action=\"%s\" source=%s - not the active interaction profile, correctly untouched", action_name(action), core_trigger_source_path(action));
+layer_log(message);
   }
   if (r & CORE_QUERY_FIRST_UNMODIFIED)
   {
@@ -973,14 +1019,24 @@ static int layer_click_match(XrAction action, XrPath sub)
   return layer_hand_match(sub, hands);
 }
 
-static void layer_trigger_diag(const char *method, XrAction action, float raw)
+static void layer_firepath_tick(void)
+{
+  char line[768];
+  if (!core_fire_due((unsigned long long)GetTickCount64()))
+    return;
+  for (int h = CORE_HAND_RIGHT; h <= CORE_HAND_LEFT; ++h)
+    if (core_fire_format(h, &config.trigger, line, sizeof(line)))
+      layer_log(line);
+}
+
+static void layer_trigger_diag(const char *method, XrAction action, float raw, int hand)
 {
   float curved = core_trigger_curve(raw, &config.trigger);
   int pressed = core_trigger_pressed(raw, &config.trigger);
   if (core_trigger_log_gate(raw, curved, pressed, (unsigned long long)GetTickCount64()))
   {
 	char line[768];
-	core_trigger_format_diag(line, sizeof(line), method, action_name(action), action, "right", raw,
+	core_trigger_format_diag(line, sizeof(line), method, action_name(action), action, hand == CORE_HAND_LEFT ? "left" : "right", raw,
 							 curved, core_trigger_output(raw, &config.trigger), pressed,
 							 &config.trigger);
 	layer_log(line);
@@ -1007,7 +1063,7 @@ static XrResult XRAPI_CALL layer_get_action_state_boolean(
 		!core_trigger_target_excludes(getInfo->action))
 	{
 	  XrAction trigger_action = core_trigger_sources_known()
-									? core_trigger_find_float_action(CORE_HAND_RIGHT)
+									? core_trigger_find_float_action(layer_hand_of(getInfo->subactionPath, 3) ? layer_hand_of(getInfo->subactionPath, 3) : CORE_HAND_RIGHT)
 									: action_handle_for_name("trigger");
 	  XrActionStateGetInfo trigger_info = {XR_TYPE_ACTION_STATE_GET_INFO};
 	  XrActionStateFloat trigger_state = {XR_TYPE_ACTION_STATE_FLOAT};
@@ -1028,7 +1084,7 @@ static XrResult XRAPI_CALL layer_get_action_state_boolean(
 		  state->currentState = core_trigger_pressed(trigger_state.currentState, &config.trigger);
 		  state->changedSinceLastSync = trigger_state.changedSinceLastSync;
 		  state->lastChangeTime = trigger_state.lastChangeTime;
-		  layer_trigger_diag(method, trigger_action, trigger_state.currentState);
+		  layer_trigger_diag(method, trigger_action, trigger_state.currentState, layer_hand_of(getInfo->subactionPath, 3) ? layer_hand_of(getInfo->subactionPath, 3) : CORE_HAND_RIGHT);
 		  modified = 1;
 		}
 	  }
@@ -1036,24 +1092,29 @@ static XrResult XRAPI_CALL layer_get_action_state_boolean(
 	else if (result == XR_SUCCESS && layer_click_match(getInfo->action, getInfo->subactionPath))
 	{
 	  char message[768];
-	  int have = 0, det;
+	  int have = 0, det, ch = CORE_HAND_RIGHT, chands = 0;
+  const char *hn;
 	  float araw = 0.0f, aout = 0.0f;
 	  is_click = 1;
 	  det = core_detent_note(getInfo->action, (int)original_state);
-	  core_analog_cached(CORE_HAND_RIGHT, &aout, &araw);
+	  core_action_role(getInfo->action, &chands, NULL);
+  ch = layer_hand_of(getInfo->subactionPath, chands) ? layer_hand_of(getInfo->subactionPath, chands) : CORE_HAND_RIGHT;
+  hn = ch == CORE_HAND_LEFT ? "left" : "right";
+  core_analog_cached(ch, &aout, &araw);
 	  if (det)
 	  {
 		snprintf(message, sizeof(message),
-				 "DETENT hand=right action=\"%s\" runtime_click %d -> %d analog_cached=%.6f analog_rawpull_cached=%.6f",
-				 action_name(getInfo->action), det == 1 ? 0 : 1, det == 1 ? 1 : 0, aout, araw);
+				 "DETENT hand=%s action=\"%s\" runtime_click %d -> %d analog_cached=%.6f analog_rawpull_cached=%.6f",
+				 hn, action_name(getInfo->action), det == 1 ? 0 : 1, det == 1 ? 1 : 0, aout, araw);
 		layer_log(message);
 	  }
-	  state->currentState = core_click_synth(CORE_HAND_RIGHT, (int)original_state, &config.trigger, &compare, &have);
+	  state->currentState = core_click_synth(ch, (int)original_state, &config.trigger, &compare, &have);
+  core_fire_note_click(ch, getInfo->action, (int)original_state, (int)state->currentState, compare);
 	  if (!have && core_click_warn_noanalog(getInfo->action))
 	  {
 		snprintf(message, sizeof(message),
-				 "WARNING click action=\"%s\" has no analog value cached yet for hand=right; analog treated as 0.0, click passes through",
-				 action_name(getInfo->action));
+				 "WARNING click action=\"%s\" has no analog value cached yet for hand=%s; analog treated as 0.0, click passes through",
+				 action_name(getInfo->action), hn);
 		layer_log(message);
 	  }
 	  if (core_trigger_click_enabled(&config.trigger))
@@ -1062,8 +1123,8 @@ static XrResult XRAPI_CALL layer_get_action_state_boolean(
 		if (core_click_changed(getInfo->action, (int)state->currentState))
 		{
 		  snprintf(message, sizeof(message),
-				   "CLICKSYN action=\"%s\" hand=right runtime=%d out=%d mode=%s compare=%.6f compare_kind=%s threshold=%.6f analog_cached=%.6f analog_rawpull_cached=%.6f",
-				   action_name(getInfo->action), (int)original_state, (int)state->currentState,
+				   "CLICKSYN action=\"%s\" hand=%s runtime=%d out=%d mode=%s compare=%.6f compare_kind=%s threshold=%.6f analog_cached=%.6f analog_rawpull_cached=%.6f",
+				   action_name(getInfo->action), hn, (int)original_state, (int)state->currentState,
 				   core_click_mode_name(config.trigger.click_mode), compare,
 				   core_click_compare_name(config.trigger.click_compare), config.trigger.click_threshold, aout, araw);
 		  layer_log(message);
@@ -1125,9 +1186,31 @@ static XrResult XRAPI_CALL layer_get_action_state_float(
 		layer_log(m);
 	  }
 	  state->currentState = core_trigger_output(raw, &config.trigger);
-	  core_analog_store(CORE_HAND_RIGHT, raw, &config.trigger);
+	  int fhands = 0;
+  core_action_role(getInfo->action, &fhands, NULL);
+  int fh = layer_hand_of(getInfo->subactionPath, fhands) ? layer_hand_of(getInfo->subactionPath, fhands) : CORE_HAND_RIGHT;
+  int wr = core_analog_write(fh, getInfo->action, raw, &config.trigger);
+  if (wr & CORE_WRITE_NEWWRITER)
+  {
+char cw[512];
+float ca = 0.0f, cr = 0.0f;
+unsigned nchg = 0;
+core_analog_cached(fh, &ca, &cr);
+core_analog_writer(fh, &nchg);
+snprintf(cw, sizeof(cw), "CACHEWRITE hand=%s action=\"%s\" bound=%s rawpull=%.6f analog=%.6f writer_changes=%u", fh == CORE_HAND_LEFT ? "left" : "right", action_name(getInfo->action), core_action_bound(getInfo->action) ? "yes" : "no", cr, ca, nchg);
+layer_log(cw);
+  }
+  if (wr & CORE_WRITE_INCONSISTENT)
+  {
+char cw[256];
+snprintf(cw, sizeof(cw), "WARNING analog cache inconsistent with curve identity: action=\"%s\"", action_name(getInfo->action));
+layer_log(cw);
+  }
+  if (wr)
+core_fire_note_axis(fh, getInfo->action, state->currentState);
 	  core_trigger_track(raw, state->currentState);
-	  layer_trigger_diag(method, getInfo->action, raw);
+	  layer_trigger_diag(method, getInfo->action, raw, fh);
+  layer_firepath_tick();
 	  modified = 1;
 	}
 

@@ -78,6 +78,17 @@ int core_action_role(XrAction action, int *hands, int *method);
 const char *core_role_name(int role);
 const char *core_role_method_name(int method);
 void core_analog_store(int hand, float raw, const CoreTriggerCfg *cfg);
+#define CORE_WRITE_WRITTEN 1
+#define CORE_WRITE_NEWWRITER 2
+#define CORE_WRITE_INCONSISTENT 4
+#define CORE_QUERY_UNBOUND_UNMODIFIED 8
+int core_action_bound(XrAction action);
+int core_analog_write(int hand, XrAction action, float raw, const CoreTriggerCfg *cfg);
+XrAction core_analog_writer(int hand, unsigned *changes);
+void core_fire_note_axis(int hand, XrAction action, float out);
+void core_fire_note_click(int hand, XrAction action, int runtime_click, int out, float compare);
+int core_fire_due(unsigned long long now_ms);
+int core_fire_format(int hand, const CoreTriggerCfg *cfg, char *buf, size_t size);
 int core_analog_cached(int hand, float *analog, float *rawpull);
 int core_trigger_click_value(float compare, int runtime_click, const CoreTriggerCfg *cfg);
 int core_click_synth(int hand, int runtime_click, const CoreTriggerCfg *cfg, float *compare, int *have_analog);

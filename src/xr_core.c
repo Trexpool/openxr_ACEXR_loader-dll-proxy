@@ -189,14 +189,39 @@ typedef struct
   int zero_noted;
 } TriggerSource;
 
-static float cache_analog[2];
-static float cache_raw[2];
-static int cache_seen[2];
+typedef struct
+{
+  float analog, raw, exponent, gain;
+  int seen, forced, warned;
+  XrAction writer;
+  unsigned changes;
+} HandCache;
+static HandCache hand_cache[2];
+static volatile long cache_lock;
+
+static void cache_acquire(void)
+{
+  while (__sync_lock_test_and_set(&cache_lock, 1))
+	;
+}
+
+static void cache_release(void)
+{
+  __sync_lock_release(&cache_lock);
+}
 
 static TriggerSource trigger_table[CORE_TRIGGER_TABLE];
 static int trigger_table_count;
 static int trigger_any_source;
 static char trigger_target[XR_MAX_ACTION_NAME_SIZE];
+
+typedef struct
+{
+  XrAction axis_action, click_action;
+  float axis_out, compare;
+  int click_out, runtime_click;
+} FireState;
+static FireState fire_state[2];
 
 /* Classifies a COMPLETE source path. Never a loose suffix test. */
 int core_trigger_classify_path(const char *path, int *hand_flag)
@@ -290,9 +315,8 @@ void core_trigger_reset_sources(void)
 {
   trigger_table_count = 0;
   trigger_any_source = 0;
-  memset(cache_analog, 0, sizeof(cache_analog));
-  memset(cache_raw, 0, sizeof(cache_raw));
-  memset(cache_seen, 0, sizeof(cache_seen));
+  memset(hand_cache, 0, sizeof(hand_cache));
+  memset(fire_state, 0, sizeof(fire_state));
 }
 
 void core_trigger_note_action(XrAction action, XrActionType type, const char *name)
@@ -537,38 +561,177 @@ const char *core_role_method_name(int method)
 		 : method == CORE_METHOD_NAME ? "name" : "none";
 }
 
+static int hand_index(int hand)
+{
+  return hand == CORE_HAND_LEFT ? 1 : 0;
+}
+
+/* Both fields come from the SAME sample and are written together. */
+static void cache_store(HandCache *h, float raw, const CoreTriggerCfg *cfg)
+{
+  float pull = core_trigger_pull(raw, cfg);
+  float out = core_trigger_output(raw, cfg);
+  h->raw = pull;
+  h->analog = out;
+  h->exponent = cfg->exponent;
+  h->gain = cfg->gain;
+  h->forced = cfg->force_value >= 0.0f;
+  h->seen = 1;
+}
+
 void core_analog_store(int hand, float raw, const CoreTriggerCfg *cfg)
 {
-  int i = hand == CORE_HAND_LEFT ? 1 : 0;
-  cache_analog[i] = core_trigger_output(raw, cfg);
-  cache_raw[i] = core_trigger_pull(raw, cfg);
-  cache_seen[i] = 1;
+  cache_acquire();
+  cache_store(&hand_cache[hand_index(hand)], raw, cfg);
+  cache_release();
+}
+
+int core_action_bound(XrAction action)
+{
+  TriggerSource *e = trigger_entry(action, 0);
+  if (!e || !e->has_rt)
+	return 0;
+  for (int i = 0; i < e->nsrc; ++i)
+  {
+	int r = core_trigger_classify_path(e->src[i], NULL);
+	if (e->rt[i] && (r == CORE_ROLE_AXIS || r == CORE_ROLE_CLICK))
+	  return 1;
+  }
+  return 0;
+}
+
+static int hand_has_bound_axis(int hand)
+{
+  for (int i = 0; i < trigger_table_count; ++i)
+  {
+	TriggerSource *e = &trigger_table[i];
+	resolve_role(e);
+	if (e->role_cached && e->role == CORE_ROLE_AXIS && (e->role_hands & hand) && core_action_bound(e->handle))
+	  return 1;
+  }
+  return 0;
+}
+
+/* Only the runtime-bound analog action may write the per-hand cache. */
+int core_analog_write(int hand, XrAction action, float raw, const CoreTriggerCfg *cfg)
+{
+  HandCache *h = &hand_cache[hand_index(hand)];
+  int result = CORE_WRITE_WRITTEN;
+  int bound_hand = hand_has_bound_axis(hand);
+  int bound_self = core_action_bound(action);
+  cache_acquire();
+  if (bound_hand ? !bound_self : (h->writer && h->writer != action))
+  {
+	cache_release();
+	return 0;
+  }
+  if (!bound_hand && !h->writer && raw == 0.0f)
+  {
+	cache_store(h, raw, cfg);
+	cache_release();
+	return CORE_WRITE_WRITTEN;
+  }
+  if (h->writer != action)
+  {
+	h->writer = action;
+	h->changes++;
+	result |= CORE_WRITE_NEWWRITER;
+  }
+  cache_store(h, raw, cfg);
+  if (!h->forced && !h->warned)
+  {
+	float expect = h->exponent == 1.0f ? h->raw : powf(h->raw, 1.0f / h->exponent);
+	expect = clampf(expect * h->gain, 0.0f, 1.0f);
+	if (fabsf(expect - h->analog) > 1e-4f)
+	{
+	  h->warned = 1;
+	  result |= CORE_WRITE_INCONSISTENT;
+	}
+  }
+  cache_release();
+  return result;
+}
+
+XrAction core_analog_writer(int hand, unsigned *changes)
+{
+  HandCache *h = &hand_cache[hand_index(hand)];
+  if (changes)
+	*changes = h->changes;
+  return h->writer;
 }
 
 int core_analog_cached(int hand, float *analog, float *rawpull)
 {
-  int i = hand == CORE_HAND_LEFT ? 1 : 0;
+  HandCache s;
+  cache_acquire();
+  s = hand_cache[hand_index(hand)];
+  cache_release();
   if (analog)
-	*analog = cache_analog[i];
+	*analog = s.analog;
   if (rawpull)
-	*rawpull = cache_raw[i];
-  return cache_seen[i];
+	*rawpull = s.raw;
+  return s.seen;
 }
 
 int core_click_synth(int hand, int runtime_click, const CoreTriggerCfg *cfg, float *compare, int *have_analog)
 {
-  int i = hand == CORE_HAND_LEFT ? 1 : 0;
+  HandCache s;
   float c = 0.0f;
+  cache_acquire();
+  s = hand_cache[hand_index(hand)];
+  cache_release();
   runtime_click = runtime_click ? 1 : 0;
-  if (cache_seen[i])
-	c = cfg->click_compare == CORE_COMPARE_CURVED ? cache_analog[i] : cache_raw[i];
+  if (s.seen)
+	c = cfg->click_compare == CORE_COMPARE_CURVED ? s.analog : s.raw;
   if (compare)
 	*compare = c;
   if (have_analog)
-	*have_analog = cache_seen[i];
-  if (!cache_seen[i] || !core_trigger_click_enabled(cfg))
+	*have_analog = s.seen;
+  if (!s.seen || !core_trigger_click_enabled(cfg))
 	return runtime_click;
   return core_trigger_click_value(c, runtime_click, cfg);
+}
+
+void core_fire_note_axis(int hand, XrAction action, float out)
+{
+  FireState *f = &fire_state[hand_index(hand)];
+  f->axis_action = action;
+  f->axis_out = out;
+}
+
+void core_fire_note_click(int hand, XrAction action, int runtime_click, int out, float compare)
+{
+  FireState *f = &fire_state[hand_index(hand)];
+  f->click_action = action;
+  f->runtime_click = runtime_click ? 1 : 0;
+  f->click_out = out ? 1 : 0;
+  f->compare = compare;
+}
+
+int core_fire_due(unsigned long long now_ms)
+{
+  static unsigned long long last;
+  if (last && now_ms - last < 1000ULL)
+	return 0;
+  last = now_ms;
+  return 1;
+}
+
+int core_fire_format(int hand, const CoreTriggerCfg *cfg, char *buf, size_t size)
+{
+  const FireState *f = &fire_state[hand_index(hand)];
+  const HandCache *h = &hand_cache[hand_index(hand)];
+  char axis[96], click[96], writer[96];
+  if (!f->axis_action && !f->click_action)
+	return 0;
+  snprintf(axis, sizeof(axis), "%s", f->axis_action ? core_action_name(f->axis_action) : "NONE");
+  snprintf(click, sizeof(click), "%s", f->click_action ? core_action_name(f->click_action) : "NONE");
+  snprintf(writer, sizeof(writer), "%s", h->writer ? core_action_name(h->writer) : "NONE");
+  snprintf(buf, size,
+		   "FIREPATH hand=%s axis_action=\"%s\" axis_out=%.6f click_action=\"%s\" click_out=%d runtime_click=%d compare=%.6f threshold=%.6f mode=%s cache_writer=\"%s\"",
+		   hand == CORE_HAND_LEFT ? "left" : "right", axis, f->axis_out, click, f->click_out, f->runtime_click,
+		   f->compare, cfg->click_threshold, core_click_mode_name(cfg->click_mode), writer);
+  return 1;
 }
 
 int core_click_warn_noanalog(XrAction action)
@@ -648,10 +811,10 @@ int core_query_note(XrAction action, int modified, int runtime_nonzero)
 	e->seen_click_query = 1;
 	r |= CORE_QUERY_FIRST_CLICK;
   }
-  if (role == CORE_ROLE_AXIS && (hands & CORE_HAND_RIGHT) && !modified && !e->seen_unmodified_query)
+  if (role == CORE_ROLE_AXIS && !modified && !e->seen_unmodified_query)
   {
 	e->seen_unmodified_query = 1;
-	r |= CORE_QUERY_FIRST_UNMODIFIED;
+	r |= core_action_bound(action) ? CORE_QUERY_FIRST_UNMODIFIED : CORE_QUERY_UNBOUND_UNMODIFIED;
   }
   if (role == CORE_ROLE_CLICK)
   {

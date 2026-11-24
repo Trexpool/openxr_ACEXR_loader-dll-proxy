@@ -450,6 +450,91 @@ int main(void)
     core_trigger_reset_sources();
   }
 
+  {
+    /* ---- bound-writer / left hand / firepath tests ---- */
+    XrAction vax = (XrAction)(uintptr_t)301, oax2 = (XrAction)(uintptr_t)302, mxa = (XrAction)(uintptr_t)303,
+             rcl = (XrAction)(uintptr_t)304, lax = (XrAction)(uintptr_t)305, lcl = (XrAction)(uintptr_t)306;
+    CoreTriggerCfg cfg;
+    float a = 0, r = 0, compare = 0;
+    int have = 0, bad = 0;
+
+    core_trigger_reset_sources();
+    core_trigger_cfg_defaults(&cfg);
+    cfg.exponent = 20.0f;
+    core_trigger_note_action(vax, XR_ACTION_TYPE_FLOAT_INPUT, "vive_right_trigger_axis");
+    core_trigger_note_action(oax2, XR_ACTION_TYPE_FLOAT_INPUT, "oculustouch_right_trigger_axis");
+    core_trigger_note_action(mxa, XR_ACTION_TYPE_FLOAT_INPUT, "mixedreality_right_trigger_axis");
+    core_trigger_note_action(rcl, XR_ACTION_TYPE_BOOLEAN_INPUT, "oculustouch_right_trigger_click");
+    core_trigger_note_action(lax, XR_ACTION_TYPE_FLOAT_INPUT, "oculustouch_left_trigger_axis");
+    core_trigger_note_action(lcl, XR_ACTION_TYPE_BOOLEAN_INPUT, "oculustouch_left_trigger_click");
+    core_trigger_mark_source(vax, "/user/hand/right/input/trigger/value");
+    core_trigger_mark_source(oax2, "/user/hand/right/input/trigger/value");
+    core_trigger_mark_source(mxa, "/user/hand/right/input/trigger/value");
+    core_trigger_mark_source(rcl, "/user/hand/right/input/trigger");
+    core_trigger_mark_source(lax, "/user/hand/left/input/trigger/value");
+    core_trigger_mark_source(lcl, "/user/hand/left/input/trigger");
+    core_trigger_mark_source_confirmed(oax2, "/user/hand/right/input/trigger/value");
+    core_trigger_mark_source_confirmed(lax, "/user/hand/left/input/trigger/value");
+
+    check("bound action writes cache", core_analog_write(CORE_HAND_RIGHT, oax2, 0.584314f, &cfg) != 0);
+    check("unbound vive write rejected", core_analog_write(CORE_HAND_RIGHT, vax, 0.0f, &cfg) == 0);
+    check("unbound mixedreality write rejected", core_analog_write(CORE_HAND_RIGHT, mxa, 0.0f, &cfg) == 0);
+    core_analog_cached(CORE_HAND_RIGHT, &a, &r);
+    check("cache intact after unbound zero writes", fabsf(r - 0.584314f) < 1e-5f && fabsf(a - 0.97349f) < 1e-4f);
+    {
+      unsigned n = 0;
+      check("cache writer is the bound action", core_analog_writer(CORE_HAND_RIGHT, &n) == oax2);
+    }
+
+    for (int i = 0; i < 1000; ++i)
+    {
+      float raw = (float)i / 999.0f, e;
+      core_analog_write(CORE_HAND_RIGHT, oax2, raw, &cfg);
+      core_analog_cached(CORE_HAND_RIGHT, &a, &r);
+      e = powf(r, 1.0f / cfg.exponent);
+      if (fabsf(a - e) > 1e-4f)
+        ++bad;
+    }
+    check("analog == pow(rawpull,1/exp) for 1000 samples", bad == 0);
+    core_analog_write(CORE_HAND_RIGHT, oax2, 0.498039f, &cfg);
+    core_analog_cached(CORE_HAND_RIGHT, &a, &r);
+    check("rawpull 0.498039 curves to 0.965747", fabsf(a - 0.965747f) < 1e-4f);
+
+    cfg.exponent = 1.0f;
+    cfg.click_threshold = 0.30f;
+    cfg.click_mode = CORE_CLICK_REPLACE;
+    cfg.click_compare = CORE_COMPARE_RAWPULL;
+    core_analog_write(CORE_HAND_RIGHT, oax2, 0.9f, &cfg);
+    core_analog_write(CORE_HAND_LEFT, lax, 0.1f, &cfg);
+    check("left below threshold -> no click", core_click_synth(CORE_HAND_LEFT, 1, &cfg, &compare, &have) == 0 && have && fabsf(compare - 0.1f) < 1e-5f);
+    check("right above threshold -> click (independent)", core_click_synth(CORE_HAND_RIGHT, 0, &cfg, &compare, &have) == 1);
+    core_analog_write(CORE_HAND_LEFT, lax, 0.5f, &cfg);
+    check("left above threshold -> click from own cache", core_click_synth(CORE_HAND_LEFT, 0, &cfg, &compare, &have) == 1 && fabsf(compare - 0.5f) < 1e-5f);
+    core_analog_write(CORE_HAND_RIGHT, oax2, 0.05f, &cfg);
+    check("right change does not disturb left", core_click_synth(CORE_HAND_LEFT, 0, &cfg, &compare, &have) == 1);
+
+    cfg.click_threshold = -1.0f;
+    check("threshold<0 passes runtime 1", core_click_synth(CORE_HAND_LEFT, 1, &cfg, NULL, &have) == 1);
+    check("threshold<0 passes runtime 0", core_click_synth(CORE_HAND_RIGHT, 0, &cfg, NULL, &have) == 0);
+    core_analog_write(CORE_HAND_RIGHT, oax2, 1.0f, &cfg);
+    check("threshold<0 ignores analog", core_click_synth(CORE_HAND_RIGHT, 0, &cfg, NULL, &have) == 0);
+
+    {
+      char line[768];
+      cfg.click_threshold = 0.30f;
+      core_fire_note_axis(CORE_HAND_RIGHT, oax2, 1.0f);
+      core_fire_note_click(CORE_HAND_RIGHT, rcl, 0, 1, 0.5f);
+      check("firepath formats", core_fire_format(CORE_HAND_RIGHT, &cfg, line, sizeof(line)) == 1);
+      printf("  %s\n", line);
+      check("firepath names axis, click, writer",
+            strstr(line, "hand=right") && strstr(line, "axis_action=\"oculustouch_right_trigger_axis\"") &&
+            strstr(line, "click_action=\"oculustouch_right_trigger_click\"") && strstr(line, "mode=replace") &&
+            strstr(line, "cache_writer=\"oculustouch_right_trigger_axis\"") && strstr(line, "click_out=1"));
+      check("firepath left empty when unused", core_fire_format(CORE_HAND_LEFT, &cfg, line, sizeof(line)) == 0);
+    }
+    core_trigger_reset_sources();
+  }
+
   printf("%s (%d failure(s))\n", failures ? "OVERALL FAIL" : "OVERALL PASS", failures);
   return failures ? 1 : 0;
 }

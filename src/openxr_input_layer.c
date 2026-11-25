@@ -468,9 +468,14 @@ static void load_layer_config(void)
 
 	if (strcmp(command, "trigger_range_max") == 0 && sscanf(value, "%lf", &number) == 1)
 	{
-	  if (number > 0.0)
-		config.trigger.range_max = (float)number;
+	  config.trigger.range_max = (float)number;
 	  core_trigger_cfg_sanitize(&config.trigger);
+	  if (config.trigger.range_max != (float)number)
+	  {
+		char msg[160];
+		snprintf(msg, sizeof(msg), "WARNING trigger_range_max raw=%f sanitized=%f", number, config.trigger.range_max);
+		layer_log(msg);
+	  }
 	  continue;
 	}
 

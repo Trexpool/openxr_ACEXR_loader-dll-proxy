@@ -5,6 +5,27 @@
 #include <math.h>
 
 HWND hwnd;        /* This is the handle for our window */
+static HFONT gui_font = NULL;
+
+static HFONT get_gui_font(void)
+{
+  if (!gui_font)
+  {
+    NONCLIENTMETRICSA ncm;
+    ncm.cbSize = sizeof(ncm);
+    if (SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
+      gui_font = CreateFontIndirectA(&ncm.lfMessageFont);
+    if (!gui_font)
+      gui_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+  }
+  return gui_font;
+}
+
+static void apply_gui_font(HANDLE control)
+{
+  if (control)
+    SendMessage((HWND)control, WM_SETFONT, (WPARAM)get_gui_font(), MAKELPARAM(TRUE, 0));
+}
 MSG messages;     /* Here messages to the application are saved */
 WNDCLASSEX wincl; /* Data structure for the windowclass */
 HANDLE hInstance;
@@ -705,6 +726,7 @@ HANDLE add_label(int x, int y, int tx, int ty, char *text, int id)
                                  hwnd, (HMENU)(INT_PTR)new_id,   // identificacao
                                  hInstance, NULL);
 
+  apply_gui_font(handle_n);
   return handle_n;
 }
 
@@ -712,33 +734,40 @@ static HANDLE add_action_button(int x, int y, int tx, int ty, char *text, int id
 {
   int new_id = offset_dialog_constats + id;
 
-  return CreateWindowA("button", text,
-                       WS_CHILD | WS_VISIBLE,
-                       x, y, tx, ty,
-                       hwnd, (HMENU)(INT_PTR)new_id,
-                       hInstance, NULL);
+  HANDLE handle_n = CreateWindowA("button", text,
+                                  WS_CHILD | WS_VISIBLE,
+                                  x, y, tx, ty,
+                                  hwnd, (HMENU)(INT_PTR)new_id,
+                                  hInstance, NULL);
+
+  apply_gui_font(handle_n);
+  return handle_n;
 }
 
 HANDLE add_edit(int x, int y, int tx, int ty, char *text, int id)
 {
   int new_id = offset_dialog_constats + id;
+  HANDLE handle_n = CreateWindowA("edit", text,
+                                  WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                                  x, y, tx, ty,
+                                  hwnd, (HMENU)(INT_PTR)new_id,
+                                  hInstance, NULL);
 
-  return CreateWindowA("edit", text,
-                       WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-                       x, y, tx, ty,
-                       hwnd, (HMENU)(INT_PTR)new_id,
-                       hInstance, NULL);
+  apply_gui_font(handle_n);
+  return handle_n;
 }
 
 HANDLE add_readonly(int x, int y, int tx, int ty, char *text, int id)
 {
   int new_id = offset_dialog_constats + id;
+  HANDLE handle_n = CreateWindowA("edit", text,
+                                  WS_CHILD | WS_VISIBLE | WS_BORDER | ES_READONLY | ES_AUTOHSCROLL,
+                                  x, y, tx, ty,
+                                  hwnd, (HMENU)(INT_PTR)new_id,
+                                  hInstance, NULL);
 
-  return CreateWindowA("edit", text,
-                       WS_CHILD | WS_VISIBLE | WS_BORDER | ES_READONLY | ES_AUTOHSCROLL,
-                       x, y, tx, ty,
-                       hwnd, (HMENU)(INT_PTR)new_id,
-                       hInstance, NULL);
+  apply_gui_font(handle_n);
+  return handle_n;
 }
 
 static void set_pose_text(HANDLE control, int valid, double value, const char *format)
@@ -873,6 +902,7 @@ HANDLE add_button(int x, int y, int tx, int ty, char *text, int id)
                                  hwnd, (HMENU)(INT_PTR)new_id,   // identificacao
                                  hInstance, NULL);
 
+  apply_gui_font(handle_n);
   if (handle_n)
   {
     WNDPROC original = (WNDPROC)SetWindowLongPtrA((HWND)handle_n, GWLP_WNDPROC,

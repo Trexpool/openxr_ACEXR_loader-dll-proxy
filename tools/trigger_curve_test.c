@@ -535,6 +535,58 @@ int main(void)
     core_trigger_reset_sources();
   }
 
+  {
+    CoreTriggerCfg r, base;
+    float bad[3] = {0.0f, -1.10f, 1.5f};
+    core_trigger_cfg_defaults(&r);
+    r.range_max = 0.30f;
+    core_trigger_cfg_sanitize(&r);
+    check("range_max 0.30: raw 0.30 -> exactly 1.0", core_trigger_pull(0.30f, &r) == 1.0f);
+    check("range_max 0.30: raw 0.15 -> exactly 0.5", core_trigger_pull(0.15f, &r) == 0.5f);
+    check("range_max 0.30: raw 0.0 -> exactly 0.0", core_trigger_pull(0.0f, &r) == 0.0f);
+    ok = 1;
+    for (int i = 0; i <= 10000; ++i)
+    {
+      float v = i / 10000.0f;
+      if (core_trigger_pull(v, &r) > 1.0f || core_trigger_output(v, &r) > 1.0f)
+        ok = 0;
+    }
+    check("range_max 0.30: delivered value never exceeds 1.0", ok);
+
+    core_trigger_cfg_defaults(&base);
+    core_trigger_cfg_defaults(&r);
+    r.range_max = 1.0f;
+    core_trigger_cfg_sanitize(&r);
+    ok = 1;
+    for (int i = 0; i <= 10000; ++i)
+    {
+      float v = i / 10000.0f;
+      float a = core_trigger_output(v, &r), b = core_trigger_output(v, &base);
+      if (memcmp(&a, &b, sizeof a) != 0)
+        ok = 0;
+      a = core_trigger_pull(v, &r);
+      b = v;
+      if (memcmp(&a, &b, sizeof a) != 0)
+        ok = 0;
+    }
+    check("range_max 1.0 bit-identical over 10000 samples", ok);
+
+    for (int k = 0; k < 3; ++k)
+    {
+      core_trigger_cfg_defaults(&r);
+      r.range_max = bad[k];
+      core_trigger_cfg_sanitize(&r);
+      ok = (r.range_max == 1.0f);
+      for (int i = 0; i <= 1000; ++i)
+      {
+        float v = i / 1000.0f;
+        if (core_trigger_pull(v, &r) != v || core_trigger_output(v, &r) != v)
+          ok = 0;
+      }
+      check("invalid range_max (0.0, -1.10, 1.5) falls back to 1.0, no inversion", ok);
+    }
+  }
+
   printf("%s (%d failure(s))\n", failures ? "OVERALL FAIL" : "OVERALL PASS", failures);
   return failures ? 1 : 0;
 }

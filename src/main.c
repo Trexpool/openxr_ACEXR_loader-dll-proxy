@@ -123,6 +123,7 @@ double trigger_click_threshold = -1.0;
 int trigger_click_mode = CORE_CLICK_REPLACE;
 int trigger_click_compare = CORE_COMPARE_RAWPULL;
 double trigger_range_max = 1.0;
+double trigger_range_max_raw = 1.0;
 char trigger_target_action[128] = "";
 volatile LONG action_dump_requested = 0;
 
@@ -679,8 +680,13 @@ int read_config(char *config_file)
 
     if (strcmp(cmd, "trigger_range_max") == 0)
     {
-      if (sscanf(value, "%lf", &double_temp) == 1 && double_temp > 0.0)
-        trigger_range_max = double_temp > 1.0 ? 1.0 : double_temp;
+      if (sscanf(value, "%lf", &double_temp) == 1)
+      {
+        trigger_range_max_raw = double_temp;
+        trigger_range_max = (double_temp > 0.0 && double_temp <= 1.0) ? double_temp : 1.0;
+        if (trigger_range_max != double_temp)
+          log_message("WARNING: trigger_range_max raw=%f is outside (0,1]; sanitized=%f", double_temp, trigger_range_max);
+      }
       continue;
     }
 
@@ -1320,6 +1326,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
     log_message("selected profile: legacy-flat");
     log_message("config path: %s", config_file_path);
     log_message("frame mode: %s", right_hand_frame_local ? "local" : "world");
+    log_message("CONFIG trigger_range_max=%f raw=%f sanitized=%f", trigger_range_max, trigger_range_max_raw, trigger_range_max);
 
     log_message("Using the following rotation offsets:");
     log_message("left: %fx%fx%f",

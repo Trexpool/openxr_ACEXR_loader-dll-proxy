@@ -38,8 +38,6 @@ void core_trigger_cfg_sanitize(CoreTriggerCfg *cfg)
   cfg->force_value = (cfg->force_value >= 0.0f) ? clampf(cfg->force_value, 0.0f, 1.0f) : -1.0f;
   if (!(cfg->range_max > 0.0f) || cfg->range_max > 1.0f)
 	cfg->range_max = 1.0f;
-  else if (cfg->range_max < 0.05f)
-	cfg->range_max = 0.05f;
   cfg->click_threshold = (cfg->click_threshold >= 0.0f) ? clampf(cfg->click_threshold, 0.0f, 1.0f) : -1.0f;
   if (cfg->click_mode < CORE_CLICK_REPLACE || cfg->click_mode > CORE_CLICK_AND)
     cfg->click_mode = CORE_CLICK_REPLACE;

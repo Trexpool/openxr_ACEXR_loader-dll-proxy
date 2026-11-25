@@ -6,7 +6,16 @@ A proxy DLL for the Khronos `openxr_loader.dll` ([OpenXR loader specification](h
 
 Video description and demonstration: https://www.youtube.com/watch?v=WixaeDdFIWg
 
-Credits: based on the upstream [openxr_loader-dll-proxy](https://github.com/aruametello/openxr_loader-dll-proxy) project by aruametello. Built against the [Khronos OpenXR SDK](https://github.com/KhronosGroup/OpenXR-SDK).
+## LICENSE STATUS
+
+This project is not yet licensed for public redistribution, because the upstream code it is forked from is unlicensed: the upstream repository has no LICENSE file and no license statement. A request has been made to the upstream author about licensing. A pull request offering these improvements back upstream is planned but has not yet been opened. No license is granted by this repository.
+
+## Credits
+
+- **Upstream project:** [openxr_loader-dll-proxy](https://github.com/aruametello/openxr_loader-dll-proxy) by aruametello. This repository is a fork of that project.
+- **This fork:** [Trexpool/openxr_ACEXR_loader-dll-proxy](https://github.com/Trexpool/openxr_ACEXR_loader-dll-proxy).
+- **This project's own work:** the shared trigger core (`src/xr_core.c`, `src/xr_core.h`), the OpenXR API layer (`src/openxr_input_layer.c`), the trigger processing and click synthesis, the popup GUI rework, the offline regression tests (`tools/trigger_curve_test.c`), the calibration analysis tool (`tools/calib_analysis.c`), and the documentation. See [NOTICE.md](NOTICE.md) for the file-by-file breakdown.
+- **Khronos OpenXR SDK:** [github.com/KhronosGroup/OpenXR-SDK](https://github.com/KhronosGroup/OpenXR-SDK).
 
 ## Requirements
 

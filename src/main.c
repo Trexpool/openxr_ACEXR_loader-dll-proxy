@@ -1,5 +1,5 @@
-/*
-    Copyright (C) 2022 Aru� Metello <aruametello@gmail.com>
+﻿/*
+    Copyright (C) 2022 Aruï¿½ Metello <aruametello@gmail.com>
 
     Permission to use, copy, modify, and/or distribute this software for any
     purpose with or without fee is hereby granted, provided that the above
@@ -60,9 +60,11 @@
 #include <math.h>
 #include <ctype.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "main.h"
 #include "gui.h"
+#include "xr_core.h"
 
 // uses https://github.com/MartinWeigel/Quaternion for quaternions because i suck at math
 #include "Quaternion.h"
@@ -87,6 +89,43 @@ FILE *h_log = 0;
 
 char root_folder[256];      // workdir, OG dll and config file location.
 char config_file_path[256]; // fullpath of the config file
+char process_executable_basename[256];
+
+#define BINDING_REMAP_CAPACITY 32
+#define ACTION_BINDING_REMAP_CAPACITY 64
+typedef struct
+{
+  char source_path[XR_MAX_PATH_LENGTH];
+  char target_path[XR_MAX_PATH_LENGTH];
+} BindingRemap;
+
+typedef struct
+{
+  char action_name[XR_MAX_ACTION_NAME_SIZE];
+  char source_path[XR_MAX_PATH_LENGTH];
+  char target_path[XR_MAX_PATH_LENGTH];
+  int mode;
+} ActionBindingRemap;
+
+BindingRemap binding_remaps[BINDING_REMAP_CAPACITY];
+int binding_remap_count = 0;
+ActionBindingRemap action_binding_remaps[ACTION_BINDING_REMAP_CAPACITY];
+int action_binding_remap_count = 0;
+int binding_logging_enabled = 1;
+int binding_remapping_enabled = 0;
+char binding_profile_process[256] = "readyornot-win64-shipping.exe";
+double trigger_press_threshold = 0.50;
+double trigger_deadzone = 0.0;
+double trigger_curve_exponent = 1.0;
+double trigger_gain = 1.0;
+double trigger_force_value = -1.0;
+double trigger_click_threshold = -1.0;
+int trigger_click_mode = CORE_CLICK_REPLACE;
+int trigger_click_compare = CORE_COMPARE_RAWPULL;
+double trigger_range_max = 1.0;
+double trigger_range_max_raw = 1.0;
+char trigger_target_action[128] = "";
+volatile LONG action_dump_requested = 0;
 
 /*
     some default values for the offsets
@@ -107,6 +146,9 @@ double offset_position_left_z = 0.0;
 double offset_position_right_x = 0.0;
 double offset_position_right_y = 0.0;
 double offset_position_right_z = 0.0;
+
+int right_hand_frame_local = 0;
+int capture_ads_apply_position = 0;
 
 // those are not constant, and will be corrected by xrStringToPath as needed.
 XrPath id_user_hand_left = 9;
@@ -134,19 +176,278 @@ int action_space_list_hand_left_cnt = 0;
 XrSpace action_space_list_hand_left[64];
 int action_space_list_hand_right_cnt = 0;
 XrSpace action_space_list_hand_right[64];
+int action_space_list_hand_right_kind[64];
 
 int ref_action_space_list_hand_left_cnt = 0;
 XrAction ref_action_space_list_hand_left[64];
 int ref_action_space_list_hand_right_cnt = 0;
 XrAction ref_action_space_list_hand_right[64];
+int action_space_list_hand_right_aim_cnt = 0;
+XrSpace action_space_list_hand_right_aim[64];
+
+XrAction action_metadata[64];
+char action_metadata_names[64][XR_MAX_ACTION_NAME_SIZE];
+int action_metadata_cnt = 0;
+
+CRITICAL_SECTION pose_snapshot_lock;
+XrPosef latest_head_pose;
+XrSpace latest_head_base_space = XR_NULL_HANDLE;
+int latest_head_pose_valid = 0;
+PoseDisplaySnapshot pose_display_left = {0};
+PoseDisplaySnapshot pose_display_right = {0};
+volatile LONG pose_capture_active = 0;
+volatile LONG pose_capture_left = 0;
+volatile LONG pose_capture_right = 0;
 
 #define ACTION_SPACE_LIST_CAPACITY 64
+
+int log_message(const char *fmt, ...);
+static XrInstance diag_instance = XR_NULL_HANDLE;
+static void proxy_dump_action_table(const char *why);
+static void proxy_exit_summary(void)
+{
+  char line[256];
+  core_trigger_summary(line, sizeof(line));
+  log_message("%s", line);
+}
+static Quaternion quaternion_from_xr(const XrQuaternionf *orientation)
+{
+  Quaternion result;
+  result.v[Z_AXIS] = orientation->z;
+  result.v[Y_AXIS] = orientation->y;
+  result.v[X_AXIS] = orientation->x;
+  result.w = orientation->w;
+  return result;
+}
+
+static int right_action_space_kind(XrSpace space)
+{
+  for (int c = 0; c < action_space_list_hand_right_cnt; c++)
+  {
+    if (action_space_list_hand_right[c] == space)
+      return action_space_list_hand_right_kind[c];
+  }
+  return 0;
+}
+
+static void proxy_trigger_cfg(CoreTriggerCfg *cfg)
+{
+  cfg->deadzone = (float)trigger_deadzone;
+  cfg->exponent = (float)trigger_curve_exponent;
+  cfg->press_threshold = (float)trigger_press_threshold;
+  cfg->gain = (float)trigger_gain;
+  cfg->force_value = (float)trigger_force_value;
+  cfg->range_max = (float)trigger_range_max;
+  cfg->click_threshold = (float)trigger_click_threshold;
+  cfg->click_mode = trigger_click_mode;
+  cfg->click_compare = trigger_click_compare;
+  core_trigger_cfg_sanitize(cfg);
+}
+
+static void update_pose_display_snapshot(int left, XrSpace base_space, const XrPosef *controller_pose)
+{
+  if (!InterlockedCompareExchange(&pose_capture_active, 0, 0))
+    return;
+
+  volatile LONG *captured = left ? &pose_capture_left : &pose_capture_right;
+  if (InterlockedCompareExchange(captured, 0, 0))
+    return;
+
+  PoseDisplaySnapshot *snapshot = left ? &pose_display_left : &pose_display_right;
+  EnterCriticalSection(&pose_snapshot_lock);
+
+#ifdef BASE_SPACE_DIAGNOSTIC
+  Quaternion controller = quaternion_from_xr(&controller_pose->orientation);
+  float base_space_rotation[3];
+  Quaternion_toEulerZYX(&controller, base_space_rotation);
+
+  snapshot->rotation_x = radToDeg(base_space_rotation[X_AXIS]);
+  snapshot->rotation_y = radToDeg(base_space_rotation[Y_AXIS]);
+  snapshot->rotation_z = radToDeg(base_space_rotation[Z_AXIS]);
+  snapshot->position_x = controller_pose->position.x;
+  snapshot->position_y = controller_pose->position.y;
+  snapshot->position_z = controller_pose->position.z;
+  snapshot->valid = 1;
+  InterlockedExchange(captured, 1);
+  if (InterlockedCompareExchange(&pose_capture_left, 0, 0) &&
+      InterlockedCompareExchange(&pose_capture_right, 0, 0))
+    InterlockedExchange(&pose_capture_active, 0);
+  LeaveCriticalSection(&pose_snapshot_lock);
+  return;
+#else
+  if (!latest_head_pose_valid || latest_head_base_space != base_space)
+  {
+    snapshot->valid = 0;
+    LeaveCriticalSection(&pose_snapshot_lock);
+    return;
+  }
+
+  Quaternion head = quaternion_from_xr(&latest_head_pose.orientation);
+  Quaternion controller = quaternion_from_xr(&controller_pose->orientation);
+  Quaternion inverse_head;
+  Quaternion relative_orientation;
+  Quaternion_conjugate(&head, &inverse_head);
+  Quaternion_multiply(&inverse_head, &controller, &relative_orientation);
+
+  float relative_position_input[3] = {
+      controller_pose->position.x - latest_head_pose.position.x,
+      controller_pose->position.y - latest_head_pose.position.y,
+      controller_pose->position.z - latest_head_pose.position.z};
+  float relative_position[3];
+  Quaternion_rotate(&inverse_head, relative_position_input, relative_position);
+
+  float relative_rotation[3];
+  Quaternion_toEulerZYX(&relative_orientation, relative_rotation);
+
+  {
+    Quaternion implied;
+    Quaternion_conjugate(&relative_orientation, &implied);
+    log_message("CAPTURE_DIAG space=%llu kind=%d head_xyzw=%.6f,%.6f,%.6f,%.6f controller_xyzw=%.6f,%.6f,%.6f,%.6f "
+                "relative_xyzw=%.6f,%.6f,%.6f,%.6f implied_offset_xyzw=%.6f,%.6f,%.6f,%.6f",
+                (unsigned long long)latest_head_base_space, left ? -1 : 0,
+                latest_head_pose.orientation.x, latest_head_pose.orientation.y,
+                latest_head_pose.orientation.z, latest_head_pose.orientation.w,
+                controller_pose->orientation.x, controller_pose->orientation.y,
+                controller_pose->orientation.z, controller_pose->orientation.w,
+                relative_orientation.v[X_AXIS], relative_orientation.v[Y_AXIS],
+                relative_orientation.v[Z_AXIS], relative_orientation.w,
+                implied.v[X_AXIS], implied.v[Y_AXIS], implied.v[Z_AXIS], implied.w);
+  }
+
+  snapshot->rotation_x = radToDeg(relative_rotation[X_AXIS]);
+  snapshot->rotation_y = radToDeg(relative_rotation[Y_AXIS]);
+  snapshot->rotation_z = radToDeg(relative_rotation[Z_AXIS]);
+  snapshot->position_x = relative_position[X_AXIS];
+  snapshot->position_y = relative_position[Y_AXIS];
+  snapshot->position_z = relative_position[Z_AXIS];
+  snapshot->valid = 1;
+  InterlockedExchange(captured, 1);
+  if (InterlockedCompareExchange(&pose_capture_left, 0, 0) &&
+      InterlockedCompareExchange(&pose_capture_right, 0, 0))
+    InterlockedExchange(&pose_capture_active, 0);
+  LeaveCriticalSection(&pose_snapshot_lock);
+#endif
+}
+
+void request_pose_capture(void)
+{
+  EnterCriticalSection(&pose_snapshot_lock);
+  pose_display_left.valid = 0;
+  pose_display_right.valid = 0;
+  InterlockedExchange(&pose_capture_left, 0);
+  InterlockedExchange(&pose_capture_right, 0);
+  InterlockedExchange(&pose_capture_active, 1);
+  LeaveCriticalSection(&pose_snapshot_lock);
+  log_message("On-demand pose capture armed. right_spaces=%d right_aim_spaces=%d", action_space_list_hand_right_cnt, action_space_list_hand_right_aim_cnt);
+}
+
+int get_pose_display_snapshot(int left, PoseDisplaySnapshot *snapshot)
+{
+  if (!snapshot)
+    return 0;
+
+  EnterCriticalSection(&pose_snapshot_lock);
+  *snapshot = left ? pose_display_left : pose_display_right;
+  LeaveCriticalSection(&pose_snapshot_lock);
+  return snapshot->valid;
+}
+
+int apply_captured_ads_calibration(void)
+{
+  PoseDisplaySnapshot right;
+  Quaternion captured_relative;
+  Quaternion desired_offset;
+  float captured_zyx[3];
+  float offset_zyx[3];
+
+  EnterCriticalSection(&pose_snapshot_lock);
+  right = pose_display_right;
+  LeaveCriticalSection(&pose_snapshot_lock);
+
+  if (!right.valid)
+  {
+    log_message("ADS calibration apply skipped: missing right-hand snapshot.");
+    return 0;
+  }
+
+  /*
+      Snapshot rotations are headset-relative Euler ZYX angles in degrees.
+      We need the true inverse rotation (quaternion conjugate), not per-axis negation.
+  */
+  captured_zyx[X_AXIS] = degToRad(right.rotation_x);
+  captured_zyx[Y_AXIS] = degToRad(right.rotation_y);
+  captured_zyx[Z_AXIS] = degToRad(right.rotation_z);
+  Quaternion_fromEulerZYX(captured_zyx, &captured_relative);
+  Quaternion_conjugate(&captured_relative, &desired_offset);
+  Quaternion_toEulerZYX(&desired_offset, offset_zyx);
+
+  offset_rotation_right_x = offset_zyx[X_AXIS];
+  offset_rotation_right_y = offset_zyx[Y_AXIS];
+  offset_rotation_right_z = offset_zyx[Z_AXIS];
+  if (capture_ads_apply_position)
+  {
+    offset_position_right_x = right.position_x;
+    offset_position_right_y = right.position_y;
+    offset_position_right_z = right.position_z;
+  }
+  else
+  {
+    offset_position_right_x = 0.0;
+    offset_position_right_y = 0.0;
+    offset_position_right_z = 0.0;
+  }
+
+  write_config(config_file_path);
+
+  log_message("ADS right-hand calibration applied. mode=%s right_capture_rot=%.2f,%.2f,%.2f right_capture_pos=%.3f,%.3f,%.3f",
+              capture_ads_apply_position ? "rotation+position" : "rotation-only",
+              right.rotation_x, right.rotation_y, right.rotation_z,
+              right.position_x, right.position_y, right.position_z);
+  log_message("ADS right-hand calibration offsets set. right_offset_rot=%.2f,%.2f,%.2f",
+              radToDeg(offset_rotation_right_x),
+              radToDeg(offset_rotation_right_y),
+              radToDeg(offset_rotation_right_z));
+
+  return 1;
+}
 
 /*
     but beware!
     the idea above is dumb and will apply offsets to anything that
     has the subspace /user/hand/left or /user/hand/right
 */
+
+#define LOG_CAP_BYTES (5L * 1024L * 1024L)
+#define LOG_KEEP_BAK 3
+static long log_bytes_written;
+static int log_pid;
+static int log_seq;
+static int log_rotating;
+char log_path[MAX_PATH];
+static char log_dir[MAX_PATH];
+
+static void log_rotate(void)
+{
+  char bak[MAX_PATH + 32];
+  if (log_rotating || !h_log)
+    return;
+  log_rotating = 1;
+  fclose(h_log);
+  h_log = 0;
+  ++log_seq;
+  snprintf(bak, sizeof(bak), "%slog_%d_%d.txt.bak", log_dir, log_pid, log_seq);
+  remove(bak);
+  rename(log_path, bak);
+  if (log_seq > LOG_KEEP_BAK)
+  {
+    char old[MAX_PATH + 32];
+    snprintf(old, sizeof(old), "%slog_%d_%d.txt.bak", log_dir, log_pid, log_seq - LOG_KEEP_BAK);
+    remove(old);
+  }
+  h_log = fopen(log_path, "a");
+  log_bytes_written = 0;
+  log_rotating = 0;
+}
 
 int log_message(const char *fmt, ...)
 {
@@ -165,9 +466,34 @@ int log_message(const char *fmt, ...)
   return 1;
 #endif // debug
 
+  {
+    log_bytes_written += (long)strlen(buffer) + 1;
+    if (log_bytes_written > LOG_CAP_BYTES)
+      log_rotate();
+  }
   fprintf(h_log, "%s\n", buffer);
   fflush(h_log);
 
+  return 1;
+}
+
+int log_throttle_ok(void)
+{
+  static unsigned long long window_start;
+  static int count;
+  unsigned long long now = (unsigned long long)GetTickCount64();
+  if (binding_logging_enabled <= 0)
+    return 0;
+  if (binding_logging_enabled >= 2)
+    return 1;
+  if (now - window_start >= 1000ULL)
+  {
+    window_start = now;
+    count = 0;
+  }
+  if (count >= 4)
+    return 0;
+  ++count;
   return 1;
 }
 
@@ -241,6 +567,191 @@ int read_config(char *config_file)
       size_t cmd_len = strnlen(line, sizeof(cmd) - 1);
       memcpy(cmd, line, cmd_len);
       cmd[cmd_len] = 0;
+    }
+
+    if (strcmp(cmd, "frame") == 0)
+    {
+      if (strcmp(value, "local") == 0)
+        right_hand_frame_local = 1;
+      else if (strcmp(value, "world") == 0)
+        right_hand_frame_local = 0;
+      else
+      {
+        fclose(arq);
+        log_message("Invalid frame value found in the config file:%s!\n", config_file);
+        write_config(config_file);
+        return 1;
+      }
+      continue;
+    }
+
+    if (strcmp(cmd, "capture_ads_apply_position") == 0)
+    {
+      capture_ads_apply_position = (strcmp(value, "1") == 0);
+      continue;
+    }
+
+    if (strcmp(cmd, "capture_ads_apply_position") == 0)
+    {
+      capture_ads_apply_position = (strcmp(value, "1") == 0);
+      continue;
+    }
+
+    if (strncmp(cmd, "remap_action_", 13) == 0 ||
+        strncmp(cmd, "remap_add_action_", 17) == 0 ||
+        strncmp(cmd, "remap_disable_action_", 21) == 0)
+    {
+      const char *prefix = cmd;
+      int mode = 0;
+      if (strncmp(cmd, "remap_add_action_", 17) == 0)
+      {
+        prefix = cmd + 17;
+        mode = 1;
+      }
+      else if (strncmp(cmd, "remap_disable_action_", 21) == 0)
+      {
+        prefix = cmd + 21;
+        mode = 2;
+      }
+      else
+      {
+        prefix = cmd + 13;
+      }
+
+      const char *path = strstr(prefix, "_/user/");
+      if (action_binding_remap_count < ACTION_BINDING_REMAP_CAPACITY && path)
+      {
+        ActionBindingRemap *remap = &action_binding_remaps[action_binding_remap_count];
+        size_t action_len = (size_t)(path - prefix);
+        if (action_len >= sizeof(remap->action_name))
+          action_len = sizeof(remap->action_name) - 1;
+        memcpy(remap->action_name, prefix, action_len);
+        remap->action_name[action_len] = 0;
+        strncpy(remap->source_path, path + 1, sizeof(remap->source_path) - 1);
+        remap->source_path[sizeof(remap->source_path) - 1] = 0;
+        strncpy(remap->target_path, value, sizeof(remap->target_path) - 1);
+        remap->target_path[sizeof(remap->target_path) - 1] = 0;
+        remap->mode = mode;
+        action_binding_remap_count++;
+      }
+      continue;
+    }
+
+    if (strcmp(cmd, "trigger_press_threshold") == 0)
+    {
+      if (sscanf(value, "%lf", &double_temp) == 1)
+      {
+        if (double_temp < 0.0 && core_trigger_note_negative_threshold())
+          log_message("WARNING: negative threshold is not a sensitivity; use trigger_gain=N.N for gain and threshold=0..1 for the cutoff (value %f clamped to 0 in memory; file untouched)", double_temp);
+        trigger_press_threshold = double_temp < 0.0 ? 0.0 : (double_temp > 1.0 ? 1.0 : double_temp);
+      }
+      continue;
+    }
+
+    if (strcmp(cmd, "trigger_force_value") == 0)
+    {
+      if (sscanf(value, "%lf", &double_temp) == 1)
+        trigger_force_value = double_temp < 0.0 ? -1.0 : (double_temp > 1.0 ? 1.0 : double_temp);
+      continue;
+    }
+
+    if (strcmp(cmd, "trigger_click_threshold") == 0)
+    {
+      if (sscanf(value, "%lf", &double_temp) == 1)
+        trigger_click_threshold = double_temp < 0.0 ? -1.0 : (double_temp > 1.0 ? 1.0 : double_temp);
+      continue;
+    }
+
+    if (strcmp(cmd, "click_mode") == 0)
+    {
+      int m = core_click_mode_parse(value);
+      if (m >= 0)
+        trigger_click_mode = m;
+      continue;
+    }
+
+    if (strcmp(cmd, "click_compare") == 0)
+    {
+      int m = core_click_compare_parse(value);
+      if (m >= 0)
+        trigger_click_compare = m;
+      continue;
+    }
+
+    if (strcmp(cmd, "trigger_range_max") == 0)
+    {
+      if (sscanf(value, "%lf", &double_temp) == 1)
+      {
+        trigger_range_max_raw = double_temp;
+        trigger_range_max = (double_temp > 0.0 && double_temp <= 1.0) ? double_temp : 1.0;
+        if (trigger_range_max != double_temp)
+          log_message("WARNING: trigger_range_max raw=%f is outside (0,1]; sanitized=%f", double_temp, trigger_range_max);
+      }
+      continue;
+    }
+
+    if (strcmp(cmd, "trigger_target_action") == 0)
+    {
+      strncpy(trigger_target_action, value, sizeof(trigger_target_action) - 1);
+      trigger_target_action[sizeof(trigger_target_action) - 1] = 0;
+      core_trigger_set_target(trigger_target_action);
+      continue;
+    }
+
+    if (strcmp(cmd, "trigger_gain") == 0)
+    {
+      if (sscanf(value, "%lf", &double_temp) == 1 && double_temp >= 0.0)
+        trigger_gain = double_temp > 100.0 ? 100.0 : double_temp;
+      continue;
+    }
+
+    if (strcmp(cmd, "trigger_deadzone") == 0)
+    {
+      if (sscanf(value, "%lf", &double_temp) == 1)
+        trigger_deadzone = double_temp < 0.0 ? 0.0 : (double_temp > 0.9 ? 0.9 : double_temp);
+      continue;
+    }
+
+    if (strcmp(cmd, "trigger_curve_exponent") == 0)
+    {
+      if (sscanf(value, "%lf", &double_temp) == 1 && double_temp > 0.0)
+        trigger_curve_exponent = double_temp;
+      continue;
+    }
+
+    if (strcmp(cmd, "binding_log") == 0)
+    {
+      binding_logging_enabled = atoi(value);
+      if (binding_logging_enabled < 0 || binding_logging_enabled > 2)
+        binding_logging_enabled = 1;
+      continue;
+    }
+
+    if (strcmp(cmd, "remap_enabled") == 0)
+    {
+      binding_remapping_enabled = (strcmp(value, "1") == 0);
+      continue;
+    }
+
+    if (strcmp(cmd, "profile_process") == 0)
+    {
+      strncpy(binding_profile_process, value, sizeof(binding_profile_process) - 1);
+      binding_profile_process[sizeof(binding_profile_process) - 1] = 0;
+      continue;
+    }
+
+    if (strncmp(cmd, "remap_source_", 13) == 0)
+    {
+      if (binding_remap_count < BINDING_REMAP_CAPACITY && value[0] != 0)
+      {
+        BindingRemap *remap = &binding_remaps[binding_remap_count];
+        strncpy(remap->source_path, cmd + 13, sizeof(remap->source_path) - 1);
+        remap->source_path[sizeof(remap->source_path) - 1] = 0;
+        strncpy(remap->target_path, value, sizeof(remap->target_path) - 1);
+        remap->target_path[sizeof(remap->target_path) - 1] = 0;
+        binding_remap_count++;
+      }
+      continue;
     }
 
     if (sscanf(value, "%lf", &double_temp) != 1)
@@ -318,6 +829,7 @@ int write_config(const char *config_file)
   if (arq)
   {
     fprintf(arq, "#offsets here are written in degrees!\n");
+    fprintf(arq, "frame=%s\n", right_hand_frame_local ? "local" : "world");
     fprintf(arq, "left_hand_rotation_offset_x=%f\n", radToDeg(offset_rotation_left_x));
     fprintf(arq, "left_hand_rotation_offset_y=%f\n", radToDeg(offset_rotation_left_y));
     fprintf(arq, "left_hand_rotation_offset_z=%f\n", radToDeg(offset_rotation_left_z));
@@ -333,6 +845,47 @@ int write_config(const char *config_file)
     fprintf(arq, "right_hand_position_offset_x=%f\n", offset_position_right_x);
     fprintf(arq, "right_hand_position_offset_y=%f\n", offset_position_right_y);
     fprintf(arq, "right_hand_position_offset_z=%f\n", offset_position_right_z);
+    fprintf(arq, "\n# OpenXR binding diagnostics/profile\n");
+    fprintf(arq, "binding_log=%d\n", binding_logging_enabled);
+    fprintf(arq, "remap_enabled=%d\n", binding_remapping_enabled ? 1 : 0);
+    fprintf(arq, "profile_process=%s\n", binding_profile_process);
+    fprintf(arq, "# Boolean press threshold (0-1). Some games fire from the analog axis instead; for those, use trigger_deadzone and trigger_curve_exponent. 0.0 makes the Boolean permanently pressed.\n");
+    fprintf(arq, "trigger_press_threshold=%f\n", trigger_press_threshold);
+    fprintf(arq, "trigger_deadzone=%f\n", trigger_deadzone);
+    fprintf(arq, "trigger_curve_exponent=%f\n", trigger_curve_exponent);
+    fprintf(arq, "trigger_gain=%f\n", trigger_gain);
+    fprintf(arq, "# -1 = disabled. >=0 delivers exactly this analog value (bisect the game's fire threshold).\n");
+    fprintf(arq, "trigger_force_value=%f\n", trigger_force_value);
+    fprintf(arq, "# -1 = use hardware click. 0-1 = synthesize click (see click_mode / click_compare).\n");
+    fprintf(arq, "trigger_click_threshold=%f\n", trigger_click_threshold);
+    fprintf(arq, "# replace: out = hit | or: out = runtime_click || hit | and: out = runtime_click && hit\n");
+    fprintf(arq, "click_mode=%s\n", core_click_mode_name(trigger_click_mode));
+    fprintf(arq, "# rawpull: compare after deadzone+range, before exponent/gain | curved: compare the curved+gain value\n");
+    fprintf(arq, "click_compare=%s\n", core_click_compare_name(trigger_click_compare));
+    fprintf(arq, "trigger_range_max=%f\n", trigger_range_max);
+    fprintf(arq, "trigger_target_action=%s\n", trigger_target_action);
+    fprintf(arq, "capture_ads_apply_position=%d\n", capture_ads_apply_position ? 1 : 0);
+    fprintf(arq, "# Add remap_source_<original_path>=<target_path> entries after paths are verified.\n");
+    fprintf(arq, "# Gunman right-hand digital B/grip swap:\n");
+    fprintf(arq, "# remap_source_/user/hand/right/input/b/click=/user/hand/right/input/squeeze/click\n");
+    fprintf(arq, "# remap_source_/user/hand/right/input/squeeze/click=/user/hand/right/input/b/click\n");
+    fprintf(arq, "# Action-aware rules can preserve A while moving Gunman's actions:\n");
+    fprintf(arq, "# remap_add_action_primarybutton_/user/hand/right/input/squeeze/click=/user/hand/right/input/squeeze/click\n");
+    fprintf(arq, "# remap_disable_action_secondarybutton_/user/hand/right/input/b/click=/user/hand/right/input/b/click\n");
+    fprintf(arq, "# remap_action_grip_/user/hand/right/input/squeeze/click=/user/hand/right/input/b/click\n");
+    fprintf(arq, "# remap_action_grippressed_/user/hand/right/input/squeeze/click=/user/hand/right/input/b/click\n");
+    for (int c = 0; c < binding_remap_count; c++)
+      fprintf(arq, "remap_source_%s=%s\n", binding_remaps[c].source_path, binding_remaps[c].target_path);
+    for (int c = 0; c < action_binding_remap_count; c++)
+    {
+      const ActionBindingRemap *remap = &action_binding_remaps[c];
+      if (remap->mode == 1)
+        fprintf(arq, "remap_add_action_%s_%s=%s\n", remap->action_name, remap->source_path, remap->target_path);
+      else if (remap->mode == 2)
+        fprintf(arq, "remap_disable_action_%s_%s=%s\n", remap->action_name, remap->source_path, remap->target_path);
+      else
+        fprintf(arq, "remap_action_%s_%s=%s\n", remap->action_name, remap->source_path, remap->target_path);
+    }
 
     fclose(arq);
     // log_message("Wrote update config in %s\n",config_file);
@@ -446,6 +999,23 @@ static int join_path_filename(char *out, size_t out_sz, const char *folder, cons
   return 1;
 }
 
+static int find_action_binding_remap(const char *action_name, const char *source_path,
+                                    int *mode, const char **target_path)
+{
+  for (int c = 0; c < action_binding_remap_count; c++)
+  {
+    ActionBindingRemap *remap = &action_binding_remaps[c];
+    if (_stricmp(action_name, remap->action_name) == 0 &&
+        _stricmp(source_path, remap->source_path) == 0)
+    {
+      *mode = remap->mode;
+      *target_path = remap->target_path;
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int log_init()
 {
 #ifdef DEBUG
@@ -456,11 +1026,22 @@ int log_init()
   {
     char log_filename[256];
     srand(time(NULL));
+    log_pid = (int)GetCurrentProcessId();
     snprintf(log_filename, sizeof(log_filename), "log_%d.txt", rand());
+    snprintf(log_path, sizeof(log_path), "%s", log_filename);
     h_log = fopen(log_filename, "a");
   } while (h_log == 0);
 
   log_message("--- log start ---");
+  {
+    char full[MAX_PATH];
+    if (!_fullpath(full, log_path, sizeof(full)))
+      snprintf(full, sizeof(full), "%s", log_path);
+    snprintf(log_path, sizeof(log_path), "%s", full);
+    snprintf(log_dir, sizeof(log_dir), "%s", full);
+    { char *sl = strrchr(log_dir, '\\'); if (sl) sl[1] = 0; else log_dir[0] = 0; }
+    log_message("LOG path=%s cap=%ld bytes binding_log=%d", full, (long)LOG_CAP_BYTES, binding_logging_enabled);
+  }
   return 1;
 }
 
@@ -614,6 +1195,83 @@ PFN_xrGetInputSourceLocalizedName _xrGetInputSourceLocalizedName;
 PFN_xrApplyHapticFeedback _xrApplyHapticFeedback;
 PFN_xrStopHapticFeedback _xrStopHapticFeedback;
 
+static const char *action_name_for_handle(XrAction action)
+{
+  for (int c = 0; c < action_metadata_cnt; c++)
+  {
+    if (action_metadata[c] == action)
+      return action_metadata_names[c];
+  }
+  return core_action_name(action);
+}
+
+static XrAction action_handle_for_name(const char *name)
+{
+  for (int c = 0; c < action_metadata_cnt; c++)
+  {
+    if (_stricmp(action_metadata_names[c], name) == 0)
+      return action_metadata[c];
+  }
+  return XR_NULL_HANDLE;
+}
+
+static int binding_profile_is_active(void)
+{
+  return binding_profile_process[0] != 0 &&
+         _stricmp(process_executable_basename, binding_profile_process) == 0;
+}
+
+static void binding_path_to_string(XrInstance instance, XrPath path, char *buffer, size_t buffer_size)
+{
+  uint32_t count = 0;
+  if (!buffer || buffer_size == 0)
+    return;
+
+  buffer[0] = 0;
+  if (!_xrPathToString ||
+      _xrPathToString(instance, path, (uint32_t)buffer_size, &count, buffer) != XR_SUCCESS)
+    snprintf(buffer, buffer_size, "<path:%llu>", (unsigned long long)path);
+}
+
+static int find_binding_remap(const char *source_path, const char **target_path)
+{
+  for (int c = 0; c < binding_remap_count; c++)
+  {
+    if (_stricmp(source_path, binding_remaps[c].source_path) == 0)
+    {
+      *target_path = binding_remaps[c].target_path;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void log_matched_action_space(XrAction action, XrPath subaction_path, XrSpace space, int is_left)
+{
+  char path_string[XR_MAX_PATH_LENGTH] = {0};
+
+  if (subaction_path == id_user_hand_left)
+    snprintf(path_string, sizeof(path_string), "/user/hand/left");
+  else if (subaction_path == id_user_hand_right)
+    snprintf(path_string, sizeof(path_string), "/user/hand/right");
+  else
+    snprintf(path_string, sizeof(path_string), "<path:%llu>", (unsigned long long)subaction_path);
+
+  log_message("MATCHED ActionSpace space:%llu action:%s subaction_path:%s classification:%s frame:%s "
+              "rotation_deg:%f,%f,%f position:%f,%f,%f",
+              (unsigned long long)space,
+              action_name_for_handle(action),
+              path_string,
+              is_left ? "left" : "right",
+              is_left ? "unchanged" : (right_hand_frame_local ? "local" : "world"),
+              radToDeg(is_left ? offset_rotation_left_x : offset_rotation_right_x),
+              radToDeg(is_left ? offset_rotation_left_y : offset_rotation_right_y),
+              radToDeg(is_left ? offset_rotation_left_z : offset_rotation_right_z),
+              is_left ? offset_position_left_x : offset_position_right_x,
+              is_left ? offset_position_left_y : offset_position_right_y,
+              is_left ? offset_position_left_z : offset_position_right_z);
+}
+
 /*
     entry point of a windows dll.
 */
@@ -622,9 +1280,23 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
   if (reason == DLL_PROCESS_ATTACH)
   {
     hLThis = hInst;
+    InitializeCriticalSection(&pose_snapshot_lock);
 
     // start a logfile (before any attempt of log_message!)
     log_init();
+
+    char process_exe_name[MAX_PATH] = {0};
+    DWORD process_exe_name_length = GetModuleFileNameA(NULL, process_exe_name, sizeof(process_exe_name));
+    const char *process_exe_basename = process_exe_name;
+    for (DWORD c = 0; c < process_exe_name_length; c++)
+    {
+      if (process_exe_name[c] == '\\' || process_exe_name[c] == '/')
+        process_exe_basename = &process_exe_name[c + 1];
+    }
+    strncpy(process_executable_basename, process_exe_basename,
+            sizeof(process_executable_basename) - 1);
+    process_executable_basename[sizeof(process_executable_basename) - 1] = 0;
+    log_message("process executable: %s", process_executable_basename[0] ? process_executable_basename : "<unknown>");
 
     // try to find myself (openxr_loader.dll) within the loaded modules
     // of the current process, we need that to know what folder to look
@@ -651,7 +1323,10 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
 
     read_config(config_file_path);
 
-    log_message("read configuration file from: %s\n", config_file_path);
+    log_message("selected profile: legacy-flat");
+    log_message("config path: %s", config_file_path);
+    log_message("frame mode: %s", right_hand_frame_local ? "local" : "world");
+    log_message("CONFIG trigger_range_max=%f raw=%f sanitized=%f", trigger_range_max, trigger_range_max_raw, trigger_range_max);
 
     log_message("Using the following rotation offsets:");
     log_message("left: %fx%fx%f",
@@ -817,9 +1492,16 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
     assign_jump("xrCreateActionSet", (PFN_xrVoidFunction)xrCreateActionSet);
     assign_jump("xrCreateActionSpace", (PFN_xrVoidFunction)xrCreateActionSpace);
 
+    assign_jump("xrGetActionStateBoolean", (PFN_xrVoidFunction)xrGetActionStateBoolean);
+    assign_jump("xrGetActionStateFloat", (PFN_xrVoidFunction)xrGetActionStateFloat);
+
     assign_jump("xrLocateSpace", (PFN_xrVoidFunction)xrLocateSpace);
 
+    assign_jump("xrLocateViews", (PFN_xrVoidFunction)xrLocateViews);
+
     assign_jump("xrStringToPath", (PFN_xrVoidFunction)xrStringToPath);
+
+    assign_jump("xrSuggestInteractionProfileBindings", (PFN_xrVoidFunction)xrSuggestInteractionProfileBindings);
 
     /*
     assign_jump("xrLocateViews",(PFN_xrVoidFunction) xrLocateViews);
@@ -847,12 +1529,9 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
 
   if (reason == DLL_PROCESS_DETACH)
   {
-    log_message("--- DLL_PROCESS_DETACH, end of log ---");
-    kill_gui();
-    log_close();
-    free(jump_table);
-    free(jump_table_names);
-    FreeLibrary(hL);
+    // Do not tear down loader state from DllMain. Unity can still have
+    // OpenXR callbacks in flight while the process is unloading modules.
+    // The operating system releases these resources during process exit.
   }
 
   return 1;
@@ -990,7 +1669,9 @@ XRAPI_ATTR XrResult XRAPI_CALL xrAttachSessionActionSets(
 
   log_message("xrAttachSessionActionSets %d", rand() % 1000);
 
-  return _xrAttachSessionActionSets(session, attachInfo);
+  XrResult attached = _xrAttachSessionActionSets(session, attachInfo);
+  proxy_dump_action_table("startup");
+  return attached;
 }
 
 // xrBeginFrame
@@ -1014,6 +1695,17 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCreateAction(
 
   if (ret == XR_SUCCESS)
   {
+    int is_pose_action = 0;
+    if (action_metadata_cnt < ACTION_SPACE_LIST_CAPACITY)
+    {
+      action_metadata[action_metadata_cnt] = *action;
+      strncpy(action_metadata_names[action_metadata_cnt], createInfo->actionName,
+              sizeof(action_metadata_names[action_metadata_cnt]) - 1);
+      action_metadata_names[action_metadata_cnt][sizeof(action_metadata_names[action_metadata_cnt]) - 1] = 0;
+      action_metadata_cnt++;
+    }
+    core_trigger_note_action(*action, createInfo->actionType, createInfo->actionName);
+
     log_message("xrCreateAction parentActionset: %lu type: %d actiontype: %d actionname: %s localizedactionname: %s output: %lu",
                 actionSet,
                 createInfo->type,
@@ -1021,6 +1713,8 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCreateAction(
                 createInfo->actionName,
                 createInfo->localizedActionName,
                 *action);
+
+    is_pose_action = (createInfo->actionType == XR_ACTION_TYPE_POSE_INPUT);
 
     // list subpaths? (i dunno even what that is exactly)
     for (int c = 0; c < createInfo->countSubactionPaths; c++)
@@ -1050,6 +1744,19 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCreateAction(
       {
         ref_action_space_list_hand_right[ref_action_space_list_hand_right_cnt] = *action;
         ref_action_space_list_hand_right_cnt++;
+      }
+
+      if (is_pose_action)
+      {
+        const char *name = createInfo->actionName;
+        int is_aim_pose = strstr(name, "aim") != NULL;
+        int is_grip_pose = strstr(name, "grip") != NULL;
+        if (is_aim_pose)
+          log_message("NOTICE: action %s tagged as RIGHT AIM pose candidate.", name);
+        else if (is_grip_pose)
+          log_message("NOTICE: action %s tagged as RIGHT GRIP pose candidate.", name);
+        else
+          log_message("NOTICE: action %s tagged as RIGHT OTHER pose candidate.", name);
       }
     }
   }
@@ -1103,16 +1810,40 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCreateActionSpace(
       action_space_list_hand_left[action_space_list_hand_left_cnt] = *space;
       action_space_list_hand_left_cnt++;
     }
+    log_matched_action_space(createInfo->action, createInfo->subactionPath, *space, 1);
     return ret;
   }
   if (createInfo->subactionPath == id_user_hand_right)
   {
+    int kind = 0;
     log_message("NOTICE: assigned ActionSpace %u to the right controller by xrStringToPath match.", createInfo->action);
     if (action_space_list_hand_right_cnt < ACTION_SPACE_LIST_CAPACITY)
     {
+      const char *action_name = action_name_for_handle(createInfo->action);
+      if (action_name)
+      {
+        if (strstr(action_name, "aim") != NULL)
+          kind = 2;
+        else if (strstr(action_name, "grip") != NULL)
+          kind = 1;
+      }
       action_space_list_hand_right[action_space_list_hand_right_cnt] = *space;
+      action_space_list_hand_right_kind[action_space_list_hand_right_cnt] = kind;
       action_space_list_hand_right_cnt++;
     }
+
+    {
+      const char *action_name = action_name_for_handle(createInfo->action);
+      if (action_name && strstr(action_name, "aim") != NULL &&
+          action_space_list_hand_right_aim_cnt < ACTION_SPACE_LIST_CAPACITY)
+      {
+        action_space_list_hand_right_aim[action_space_list_hand_right_aim_cnt] = *space;
+        action_space_list_hand_right_aim_cnt++;
+        log_message("NOTICE: assigned ActionSpace %u to RIGHT AIM list by xrStringToPath match.", createInfo->action);
+      }
+    }
+
+    log_matched_action_space(createInfo->action, createInfo->subactionPath, *space, 0);
     return ret;
   }
 
@@ -1128,6 +1859,7 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCreateActionSpace(
         action_space_list_hand_left[action_space_list_hand_left_cnt] = *space;
         action_space_list_hand_left_cnt++;
       }
+        log_matched_action_space(createInfo->action, createInfo->subactionPath, *space, 1);
       return ret;
     }
   }
@@ -1135,12 +1867,33 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCreateActionSpace(
   {
     if (ref_action_space_list_hand_right[c] == createInfo->action)
     {
+      int kind = 0;
       log_message("NOTICE: assigned ActionSpace %u to the right controller by xrCreateAction match.");
       if (action_space_list_hand_right_cnt < ACTION_SPACE_LIST_CAPACITY)
       {
+        const char *action_name = action_name_for_handle(createInfo->action);
+        if (action_name)
+        {
+          if (strstr(action_name, "aim") != NULL)
+            kind = 2;
+          else if (strstr(action_name, "grip") != NULL)
+            kind = 1;
+        }
         action_space_list_hand_right[action_space_list_hand_right_cnt] = *space;
+        action_space_list_hand_right_kind[action_space_list_hand_right_cnt] = kind;
         action_space_list_hand_right_cnt++;
       }
+      {
+        const char *action_name = action_name_for_handle(createInfo->action);
+        if (action_name && strstr(action_name, "aim") != NULL &&
+            action_space_list_hand_right_aim_cnt < ACTION_SPACE_LIST_CAPACITY)
+        {
+          action_space_list_hand_right_aim[action_space_list_hand_right_aim_cnt] = *space;
+          action_space_list_hand_right_aim_cnt++;
+          log_message("NOTICE: assigned ActionSpace %u to RIGHT AIM list by xrCreateAction match.", createInfo->action);
+        }
+      }
+      log_matched_action_space(createInfo->action, createInfo->subactionPath, *space, 0);
       return ret;
     }
   }
@@ -1161,7 +1914,15 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCreateInstance(
   */
 
   log_message("xrCreateInstance %d", rand() % 1000);
-  return _xrCreateInstance(createInfo, instance);
+  {
+    XrResult created = _xrCreateInstance(createInfo, instance);
+    if (created == XR_SUCCESS && instance)
+    {
+      diag_instance = *instance;
+      atexit(proxy_exit_summary);
+    }
+    return created;
+  }
 }
 
 // xrCreateReferenceSpace
@@ -1278,8 +2039,19 @@ XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateBoundSourcesForAction(
     uint32_t *sourceCountOutput,
     XrPath *sources)
 {
-  log_message("xrEnumerateBoundSourcesForAction %d", rand() % 1000);
-  return _xrEnumerateBoundSourcesForAction(session, enumerateInfo, sourceCapacityInput, sourceCountOutput, sources);
+  XrResult ret = _xrEnumerateBoundSourcesForAction(session, enumerateInfo, sourceCapacityInput, sourceCountOutput, sources);
+  if (ret == XR_SUCCESS && enumerateInfo && sources && sourceCountOutput && diag_instance != XR_NULL_HANDLE)
+  {
+    for (uint32_t c = 0; c < *sourceCountOutput && c < sourceCapacityInput; c++)
+    {
+      char path[XR_MAX_PATH_LENGTH];
+      binding_path_to_string(diag_instance, sources[c], path, sizeof(path));
+      core_trigger_mark_source_confirmed(enumerateInfo->action, path);
+    }
+  }
+  log_message("xrEnumerateBoundSourcesForAction action=%s count=%u", action_name_for_handle(enumerateInfo ? enumerateInfo->action : XR_NULL_HANDLE),
+              sourceCountOutput ? *sourceCountOutput : 0);
+  return ret;
 }
 
 // xrEnumerateEnvironmentBlendModes
@@ -1381,24 +2153,295 @@ XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateViewConfigurations(
   return _xrEnumerateViewConfigurations(instance, systemId, viewConfigurationTypeCapacityInput, viewConfigurationTypeCountOutput, viewConfigurationTypes);
 }
 
+static int proxy_hand_of(XrPath sub, int hands)
+{
+  if ((hands & CORE_HAND_RIGHT) && (sub == id_user_hand_right || (sub == XR_NULL_PATH && hands == CORE_HAND_RIGHT)))
+    return CORE_HAND_RIGHT;
+  if ((hands & CORE_HAND_LEFT) && (sub == id_user_hand_left || (sub == XR_NULL_PATH && hands == CORE_HAND_LEFT)))
+    return CORE_HAND_LEFT;
+  return 0;
+}
+
+static void proxy_action_table_path(char *out, size_t size, int next_to_config)
+{
+  char tmp[MAX_PATH];
+  char *sl;
+  snprintf(tmp, sizeof(tmp), "%s", next_to_config ? config_file_path : log_path);
+  sl = strrchr(tmp, '\\');
+  if (sl) sl[1] = 0; else tmp[0] = 0;
+  snprintf(out, size, "%saction_table.txt", tmp);
+}
+
+static int proxy_hand_match(XrPath sub, int hands)
+{
+  if (!hands)
+	return 0;
+  return proxy_hand_of(sub, hands) != 0;
+}
+
+static int proxy_trigger_match(XrAction action, XrPath sub, int want_bool, const char **method)
+{
+  int hands = 0, m = 0;
+  int role = core_action_role(action, &hands, &m);
+  if (role == CORE_ROLE_AXIS && proxy_hand_match(sub, hands))
+  {
+	*method = (m == CORE_METHOD_NAME) ? "action_name_fallback" : "source_path";
+	return 1;
+  }
+  if (core_trigger_sources_known() || role != CORE_ROLE_OTHER)
+	return 0;
+  if (sub != id_user_hand_right)
+	return 0;
+  if (_stricmp(action_name_for_handle(action), want_bool ? "triggerpressed" : "trigger") != 0)
+	return 0;
+  *method = "action_name_fallback";
+  return 1;
+}
+
+#define CHG_SLOTS 64
+static int log_changed(XrAction action, float a, float b, int c)
+{
+  static struct { XrAction h; float a, b; int c; int used; } slot[CHG_SLOTS];
+  unsigned idx = (unsigned)((unsigned long long)action % CHG_SLOTS);
+  if (slot[idx].used && slot[idx].h == action && slot[idx].a == a && slot[idx].b == b && slot[idx].c == c)
+	return 0;
+  slot[idx].used = 1;
+  slot[idx].h = action;
+  slot[idx].a = a;
+  slot[idx].b = b;
+  slot[idx].c = c;
+  return 1;
+}
+
+static void proxy_dump_action_table(const char *why)
+{
+  char line[2048];
+  char p1[MAX_PATH + 32], p2[MAX_PATH + 32];
+  FILE *tf, *tf2;
+  proxy_action_table_path(p1, sizeof(p1), 0);
+  proxy_action_table_path(p2, sizeof(p2), 1);
+  tf = fopen(p1, "w");
+  tf2 = strcmp(p1, p2) ? fopen(p2, "w") : NULL;
+  log_message("ACTION_TABLE path=%s", p1);
+  log_message("ACTION_TABLE copy=%s", p2);
+  log_message("ACTION_TABLE dump reason=%s count=%d open=%d", why, core_action_table_count(), tf != NULL);
+  for (int c = 0; c < core_action_table_count(); c++)
+  {
+	if (core_action_table_format(c, line, sizeof(line)))
+	{
+	  log_message("%s", line);
+	  if (tf)
+		fprintf(tf, "%s\n", line);
+  if (tf2)
+fprintf(tf2, "%s\n", line);
+	}
+	if (core_action_role_format(c, line, sizeof(line)))
+	  log_message("%s", line);
+  }
+  if (tf)
+	fclose(tf);
+  if (tf2)
+fclose(tf2);
+  core_pair_format(CORE_HAND_RIGHT, line, sizeof(line));
+  log_message("%s", line);
+  core_pair_format(CORE_HAND_LEFT, line, sizeof(line));
+  log_message("%s", line);
+}
+
+static int proxy_click_match(XrAction action, XrPath sub)
+{
+  int hands = 0;
+  if (core_action_role(action, &hands, NULL) != CORE_ROLE_CLICK)
+	return 0;
+  return proxy_hand_match(sub, hands);
+}
+
+static void proxy_note_query(XrAction action, int modified, const char *kind, int runtime_nonzero)
+{
+  int r = core_query_note(action, modified, runtime_nonzero);
+  if (r & CORE_QUERY_FIRST_CLICK)
+	log_message("*** GAME QUERIES TRIGGER CLICK ACTION: action=\"%s\" source=%s (%s) ***",
+				action_name_for_handle(action), core_click_source_path(action), kind);
+  if (r & CORE_QUERY_UNBOUND_UNMODIFIED)
+log_message("INFO ANALOG-ROLE ACTION NOT BOUND BY RUNTIME: action=\"%s\" source=%s - not the active interaction profile, correctly untouched", action_name_for_handle(action), core_trigger_source_path(action));
+  if (r & CORE_QUERY_FIRST_UNMODIFIED)
+	log_message("*** BUG: ANALOG-ROLE ACTION NOT MODIFIED: action=\"%s\" source=%s (%s) ***",
+				action_name_for_handle(action), core_trigger_source_path(action), kind);
+  if (r & CORE_QUERY_CLICK_ALWAYS_ZERO)
+	log_message("INFO click action=\"%s\" runtime value has always been 0 so far",
+				action_name_for_handle(action));
+}
+
+static void proxy_firepath_tick(const CoreTriggerCfg *cfg)
+{
+  char line[768];
+  if (!core_fire_due((unsigned long long)GetTickCount64()))
+return;
+  for (int h = CORE_HAND_RIGHT; h <= CORE_HAND_LEFT; ++h)
+if (core_fire_format(h, cfg, line, sizeof(line)))
+  log_message("%s", line);
+}
+
+static void proxy_trigger_diag(const char *method, XrAction action, float raw, const CoreTriggerCfg *cfg, int hand)
+{
+  float curved = core_trigger_curve(raw, cfg);
+  int pressed = core_trigger_pressed(raw, cfg);
+  if (core_trigger_log_gate(raw, curved, pressed, (unsigned long long)GetTickCount64()))
+  {
+	char line[768];
+	core_trigger_format_diag(line, sizeof(line), method, action_name_for_handle(action), action, hand == CORE_HAND_LEFT ? "left" : "right",
+							 raw, curved, core_trigger_output(raw, cfg), pressed, cfg);
+	log_message("%s", line);
+  }
+}
+
 // xrGetActionStateBoolean
 XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateBoolean(
-    XrSession session,
-    const XrActionStateGetInfo *getInfo,
-    XrActionStateBoolean *state)
+	XrSession session,
+	const XrActionStateGetInfo *getInfo,
+	XrActionStateBoolean *state)
 {
-  log_message("xrGetActionStateBoolean %d", rand() % 1000);
-  return _xrGetActionStateBoolean(session, getInfo, state);
+  XrResult ret = _xrGetActionStateBoolean(session, getInfo, state);
+  const char *method = "";
+  int runtime_value = (ret == XR_SUCCESS && state) ? (int)state->currentState : 0;
+  int modified = 0;
+  int is_click = 0;
+  float compare = 0.0f;
+
+  if (ret == XR_SUCCESS && getInfo && state && _xrGetActionStateFloat &&
+	  proxy_trigger_match(getInfo->action, getInfo->subactionPath, 1, &method) &&
+	  !core_trigger_target_excludes(getInfo->action))
+  {
+	XrAction trigger_action = core_trigger_sources_known()
+								  ? core_trigger_find_float_action(proxy_hand_of(getInfo->subactionPath, 3) ? proxy_hand_of(getInfo->subactionPath, 3) : CORE_HAND_RIGHT)
+								  : action_handle_for_name("trigger");
+	if (trigger_action != XR_NULL_HANDLE)
+	{
+	  XrActionStateGetInfo trigger_info = {XR_TYPE_ACTION_STATE_GET_INFO};
+	  XrActionStateFloat trigger_state = {XR_TYPE_ACTION_STATE_FLOAT};
+	  trigger_info.action = trigger_action;
+	  trigger_info.subactionPath = getInfo->subactionPath;
+
+	  if (_xrGetActionStateFloat(session, &trigger_info, &trigger_state) == XR_SUCCESS &&
+		  trigger_state.isActive)
+	  {
+		CoreTriggerCfg cfg;
+		proxy_trigger_cfg(&cfg);
+		if (core_trigger_method_first_use(strcmp(method, "source_path") == 0))
+		  log_message("TRIGGER identification method: %s", method);
+		state->currentState = core_trigger_pressed(trigger_state.currentState, &cfg);
+		state->changedSinceLastSync = trigger_state.changedSinceLastSync;
+		state->lastChangeTime = trigger_state.lastChangeTime;
+		proxy_trigger_diag(method, trigger_action, trigger_state.currentState, &cfg, proxy_hand_of(getInfo->subactionPath, 3) ? proxy_hand_of(getInfo->subactionPath, 3) : CORE_HAND_RIGHT);
+		modified = 1;
+	  }
+	}
+  }
+  else if (ret == XR_SUCCESS && getInfo && state &&
+		   proxy_click_match(getInfo->action, getInfo->subactionPath))
+  {
+	CoreTriggerCfg cfg;
+	int have = 0, det, ch = CORE_HAND_RIGHT, chands = 0;
+const char *hn;
+	float araw = 0.0f, aout = 0.0f;
+	proxy_trigger_cfg(&cfg);
+	is_click = 1;
+	det = core_detent_note(getInfo->action, runtime_value);
+	core_action_role(getInfo->action, &chands, NULL);
+ch = proxy_hand_of(getInfo->subactionPath, chands) ? proxy_hand_of(getInfo->subactionPath, chands) : CORE_HAND_RIGHT;
+hn = ch == CORE_HAND_LEFT ? "left" : "right";
+core_analog_cached(ch, &aout, &araw);
+	if (det)
+	  log_message("DETENT hand=%s action=\"%s\" runtime_click %d -> %d analog_cached=%.6f analog_rawpull_cached=%.6f",
+				  hn, action_name_for_handle(getInfo->action), det == 1 ? 0 : 1, det == 1 ? 1 : 0, aout, araw);
+	state->currentState = core_click_synth(ch, runtime_value, &cfg, &compare, &have);
+core_fire_note_click(ch, getInfo->action, runtime_value, (int)state->currentState, compare);
+	if (!have && core_click_warn_noanalog(getInfo->action))
+	  log_message("WARNING click action=\"%s\" has no analog value cached yet for hand=%s; analog treated as 0.0, click passes through",
+				  action_name_for_handle(getInfo->action), hn);
+	if (core_trigger_click_enabled(&cfg))
+	{
+	  modified = 1;
+	  if (core_click_changed(getInfo->action, (int)state->currentState))
+		log_message("CLICKSYN action=\"%s\" hand=%s runtime=%d out=%d mode=%s compare=%.6f compare_kind=%s threshold=%.6f analog_cached=%.6f analog_rawpull_cached=%.6f",
+					action_name_for_handle(getInfo->action), hn, runtime_value, (int)state->currentState,
+					core_click_mode_name(cfg.click_mode), compare, core_click_compare_name(cfg.click_compare),
+					cfg.click_threshold, aout, araw);
+	}
+  }
+
+  if (ret == XR_SUCCESS && getInfo && state)
+  {
+	CoreTriggerCfg cfg;
+	const char *bound = core_click_source_path(getInfo->action);
+	proxy_trigger_cfg(&cfg);
+	if (bound[0] == '<')
+	  bound = core_trigger_source_path(getInfo->action);
+	proxy_note_query(getInfo->action, modified, "boolean", runtime_value);
+	if (binding_logging_enabled > 0 &&
+		(binding_logging_enabled >= 2 || log_changed(getInfo->action, (float)runtime_value, (float)(int)state->currentState, is_click)) &&
+		log_throttle_ok())
+	  log_message("BOOLDIG action=\"%s\" bound=\"%s\" runtime=%d out=%d mode=%s threshold=%.6f compare=%.6f compare_kind=%s",
+				  action_name_for_handle(getInfo->action), bound, runtime_value, (int)state->currentState,
+				  core_click_mode_name(cfg.click_mode), cfg.click_threshold, compare,
+				  is_click ? core_click_compare_name(cfg.click_compare) : "not-click");
+  }
+  return ret;
 }
 
 // xrGetActionStateFloat
 XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateFloat(
-    XrSession session,
-    const XrActionStateGetInfo *getInfo,
-    XrActionStateFloat *state)
+	XrSession session,
+	const XrActionStateGetInfo *getInfo,
+	XrActionStateFloat *state)
 {
-  log_message("xrGetActionStateFloat %d", rand() % 1000);
-  return _xrGetActionStateFloat(session, getInfo, state);
+  XrResult ret = _xrGetActionStateFloat(session, getInfo, state);
+  const char *method = "";
+  float runtime_value = (ret == XR_SUCCESS && state) ? state->currentState : 0.0f;
+  int modified = 0;
+  if (ret == XR_SUCCESS && getInfo && state && state->isActive &&
+	  proxy_trigger_match(getInfo->action, getInfo->subactionPath, 0, &method) &&
+	  !core_trigger_target_excludes(getInfo->action))
+  {
+	CoreTriggerCfg cfg;
+	float raw = state->currentState;
+	proxy_trigger_cfg(&cfg);
+	if (core_trigger_method_first_use(strcmp(method, "source_path") == 0))
+	  log_message("TRIGGER identification method: %s", method);
+	state->currentState = core_trigger_output(raw, &cfg);
+	int fhands = 0;
+core_action_role(getInfo->action, &fhands, NULL);
+int fh = proxy_hand_of(getInfo->subactionPath, fhands) ? proxy_hand_of(getInfo->subactionPath, fhands) : CORE_HAND_RIGHT;
+int wr = core_analog_write(fh, getInfo->action, raw, &cfg);
+if (wr & CORE_WRITE_NEWWRITER)
+{
+  float ca = 0.0f, cr = 0.0f;
+  unsigned nchg = 0;
+  core_analog_cached(fh, &ca, &cr);
+  core_analog_writer(fh, &nchg);
+  log_message("CACHEWRITE hand=%s action=\"%s\" bound=%s rawpull=%.6f analog=%.6f writer_changes=%u", fh == CORE_HAND_LEFT ? "left" : "right", action_name_for_handle(getInfo->action), core_action_bound(getInfo->action) ? "yes" : "no", cr, ca, nchg);
+}
+if (wr & CORE_WRITE_INCONSISTENT)
+  log_message("WARNING analog cache inconsistent with curve identity: action=\"%s\"", action_name_for_handle(getInfo->action));
+if (wr)
+  core_fire_note_axis(fh, getInfo->action, state->currentState);
+	core_trigger_track(raw, state->currentState);
+	proxy_trigger_diag(method, getInfo->action, raw, &cfg, fh);
+proxy_firepath_tick(&cfg);
+	modified = 1;
+  }
+  if (ret == XR_SUCCESS && getInfo && state)
+	proxy_note_query(getInfo->action, modified, "float", 0);
+  if (binding_logging_enabled > 0 && getInfo &&
+	  (binding_logging_enabled >= 2 || log_changed(getInfo->action, runtime_value, state ? state->currentState : 0.0f, modified)) &&
+	  log_throttle_ok())
+	log_message("xrGetActionStateFloat action=%s runtime=%.6f out=%.6f modified=%d result=%d",
+			  action_name_for_handle(getInfo->action),
+			  runtime_value,
+			  state ? state->currentState : 0.0f,
+			  modified,
+			  ret);
+  return ret;
 }
 
 // xrGetActionStatePose
@@ -1426,8 +2469,16 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetCurrentInteractionProfile(
     XrPath topLevelUserPath,
     XrInteractionProfileState *interactionProfile)
 {
-  log_message("xrGetCurrentInteractionProfile %d", rand() % 1000);
-  return _xrGetCurrentInteractionProfile(session, topLevelUserPath, interactionProfile);
+  XrResult ret = _xrGetCurrentInteractionProfile(session, topLevelUserPath, interactionProfile);
+  if (ret == XR_SUCCESS && interactionProfile && diag_instance != XR_NULL_HANDLE)
+  {
+    char top[XR_MAX_PATH_LENGTH];
+    char profile[XR_MAX_PATH_LENGTH];
+    binding_path_to_string(diag_instance, topLevelUserPath, top, sizeof(top));
+    binding_path_to_string(diag_instance, interactionProfile->interactionProfile, profile, sizeof(profile));
+    log_message("PROFILE_DIAG user_path=%s interaction_profile=%s", top, profile);
+  }
+  return ret;
 }
 
 // xrGetInputSourceLocalizedName
@@ -1511,6 +2562,7 @@ XRAPI_ATTR XrResult XRAPI_CALL xrLocateSpace(
     {
       if (space == action_space_list_hand_left[c])
       {
+        update_pose_display_snapshot(1, baseSpace, &location->pose);
 
         Quaternion hand;
 
@@ -1522,6 +2574,7 @@ XRAPI_ATTR XrResult XRAPI_CALL xrLocateSpace(
 
         // adding rotation offset
         Quaternion rotation;
+        /* GUI/config mapping: _x is physical pitch, _y is yaw, and _z is roll. */
         float rotation_zyx[3];
         rotation_zyx[Z_AXIS] = offset_rotation_left_z;
         rotation_zyx[Y_AXIS] = offset_rotation_left_y;
@@ -1555,6 +2608,11 @@ XRAPI_ATTR XrResult XRAPI_CALL xrLocateSpace(
     {
       if (space == action_space_list_hand_right[c])
       {
+        {
+          int kind = right_action_space_kind(space);
+          if (kind == 2 || (kind == 1 && action_space_list_hand_right_aim_cnt == 0))
+            update_pose_display_snapshot(0, baseSpace, &location->pose);
+        }
 
         Quaternion hand;
 
@@ -1563,6 +2621,7 @@ XRAPI_ATTR XrResult XRAPI_CALL xrLocateSpace(
         hand.v[Y_AXIS] = location->pose.orientation.y;
         hand.v[X_AXIS] = location->pose.orientation.x;
         hand.w = location->pose.orientation.w;
+        Quaternion original_hand = hand;
 
         // adding rotation offset
         Quaternion rotation;
@@ -1571,14 +2630,20 @@ XRAPI_ATTR XrResult XRAPI_CALL xrLocateSpace(
         rotation_zyx[Y_AXIS] = offset_rotation_right_y;
         rotation_zyx[X_AXIS] = offset_rotation_right_x;
         Quaternion_fromEulerZYX(rotation_zyx, &rotation); // quatertion with rotation offsets
-        Quaternion_multiply(&rotation, &hand, &hand);     // rotating the "real angle" with the added offset
+        if (right_hand_frame_local)
+          Quaternion_multiply(&hand, &rotation, &hand);
+        else
+          Quaternion_multiply(&rotation, &hand, &hand);     // rotating the "real angle" with the added offset
 
         float pr_zyx[3];         // the desired position offset
         float rotated_pr_zyx[3]; // holds the "rotated" position offset
         pr_zyx[X_AXIS] = offset_position_right_x;
         pr_zyx[Y_AXIS] = offset_position_right_y;
         pr_zyx[Z_AXIS] = offset_position_right_z;
-        Quaternion_rotate(&rotation, pr_zyx, rotated_pr_zyx); // do the rotation
+        if (right_hand_frame_local)
+          Quaternion_rotate(&original_hand, pr_zyx, rotated_pr_zyx);
+        else
+          Quaternion_rotate(&rotation, pr_zyx, rotated_pr_zyx); // do the rotation
 
         // apply position offset (it is catesian 3D stuff so just sum the dif)
         location->pose.position.x += rotated_pr_zyx[X_AXIS];
@@ -1612,8 +2677,19 @@ XRAPI_ATTR XrResult XRAPI_CALL xrLocateViews(
     uint32_t *viewCountOutput,
     XrView *views)
 {
+  XrResult ret = _xrLocateViews(session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput, views);
+
+  if (ret == XR_SUCCESS && viewLocateInfo && viewCountOutput && *viewCountOutput > 0 && views)
+  {
+    EnterCriticalSection(&pose_snapshot_lock);
+    latest_head_pose = views[0].pose;
+    latest_head_base_space = viewLocateInfo->space;
+    latest_head_pose_valid = 1;
+    LeaveCriticalSection(&pose_snapshot_lock);
+  }
+
   log_message("xrLocateViews %d", rand() % 1000);
-  return _xrLocateViews(session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput, views);
+  return ret;
 }
 
 // xrPathToString
@@ -1710,8 +2786,145 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSuggestInteractionProfileBindings(
     XrInstance instance,
     const XrInteractionProfileSuggestedBinding *suggestedBindings)
 {
-  log_message("xrSuggestInteractionProfileBindings %d", rand() % 1000);
-  return _xrSuggestInteractionProfileBindings(instance, suggestedBindings);
+  if (!suggestedBindings)
+    return _xrSuggestInteractionProfileBindings(instance, suggestedBindings);
+
+  char interaction_profile[XR_MAX_PATH_LENGTH];
+  binding_path_to_string(instance, suggestedBindings->interactionProfile,
+                         interaction_profile, sizeof(interaction_profile));
+
+  XrInteractionProfileSuggestedBinding forwarded = *suggestedBindings;
+  int profile_active = binding_profile_is_active();
+  int rewrite_count = 0;
+  uint32_t additional_bindings = 0;
+  if (profile_active && binding_remapping_enabled)
+  {
+    for (int c = 0; c < action_binding_remap_count; c++)
+    {
+      if (action_binding_remaps[c].mode == 1)
+        additional_bindings++;
+    }
+  }
+
+  XrActionSuggestedBinding *rewritten = NULL;
+
+  if (binding_logging_enabled || profile_active)
+  {
+    log_message("xrSuggestInteractionProfileBindings profile=%s count=%u process=%s remap_enabled=%d",
+                interaction_profile, suggestedBindings->countSuggestedBindings,
+                process_executable_basename, profile_active && binding_remapping_enabled);
+  }
+
+  if (profile_active && binding_remapping_enabled && suggestedBindings->countSuggestedBindings > 0)
+  {
+    rewritten = (XrActionSuggestedBinding *)malloc(
+        sizeof(*rewritten) * (suggestedBindings->countSuggestedBindings + additional_bindings));
+    if (rewritten)
+    {
+      memcpy(rewritten, suggestedBindings->suggestedBindings,
+             sizeof(*rewritten) * suggestedBindings->countSuggestedBindings);
+      forwarded.suggestedBindings = rewritten;
+    }
+    else
+    {
+      log_message("WARNING: could not allocate binding rewrite buffer; forwarding unchanged.");
+    }
+  }
+
+  uint32_t forwarded_count = 0;
+  for (uint32_t c = 0; c < suggestedBindings->countSuggestedBindings; c++)
+  {
+    char source_path[XR_MAX_PATH_LENGTH];
+    const XrActionSuggestedBinding *binding = &suggestedBindings->suggestedBindings[c];
+    binding_path_to_string(instance, binding->binding, source_path, sizeof(source_path));
+    core_trigger_mark_source(binding->action, source_path);
+
+    const char *replacement = NULL;
+    int action_mode = 0;
+    const char *action_replacement = NULL;
+    const char *action_name = action_name_for_handle(binding->action);
+    int action_configured = profile_active && binding_remapping_enabled &&
+                            find_action_binding_remap(action_name, source_path,
+                                                     &action_mode, &action_replacement);
+    int configured = profile_active && binding_remapping_enabled && rewritten &&
+                     find_binding_remap(source_path, &replacement);
+    if (action_configured && action_mode == 2)
+    {
+      log_message("BINDING action=%s source=%s final=<disabled> rewrite=yes",
+                  action_name, source_path);
+      rewrite_count++;
+      continue;
+    }
+
+    if (action_configured && action_mode == 0)
+    {
+      configured = 1;
+      replacement = action_replacement;
+    }
+
+    if (rewritten)
+      rewritten[forwarded_count] = *binding;
+    if (configured)
+    {
+      XrPath replacement_path = XR_NULL_PATH;
+      XrResult path_result = _xrStringToPath(instance, replacement, &replacement_path);
+      if (path_result == XR_SUCCESS)
+      {
+        rewritten[forwarded_count].binding = replacement_path;
+        rewrite_count++;
+      }
+      else
+      {
+        log_message("WARNING: remap action=%s source=%s replacement=%s could not resolve (%d).",
+                    action_name_for_handle(binding->action), source_path, replacement, path_result);
+      }
+    }
+
+    if (binding_logging_enabled || configured)
+    {
+      char final_path[XR_MAX_PATH_LENGTH];
+      binding_path_to_string(instance, configured ? rewritten[forwarded_count].binding : binding->binding,
+                             final_path, sizeof(final_path));
+      log_message("BINDING action=%s handle=%llu source=%s final=%s rewrite=%s",
+                  action_name_for_handle(binding->action),
+                  (unsigned long long)binding->action, source_path, final_path,
+                  configured ? "yes" : "no");
+    }
+    forwarded_count++;
+  }
+
+  if (rewritten && profile_active && binding_remapping_enabled)
+  {
+    for (int c = 0; c < action_binding_remap_count; c++)
+    {
+      ActionBindingRemap *remap = &action_binding_remaps[c];
+      if (remap->mode != 1)
+        continue;
+
+      XrAction action = action_handle_for_name(remap->action_name);
+      XrPath path = XR_NULL_PATH;
+      if (action == XR_NULL_HANDLE || _xrStringToPath(instance, remap->target_path, &path) != XR_SUCCESS)
+        continue;
+
+      rewritten[forwarded_count].action = action;
+      rewritten[forwarded_count].binding = path;
+      log_message("BINDING action=%s source=<added> final=%s rewrite=yes",
+                  remap->action_name, remap->target_path);
+      forwarded_count++;
+      rewrite_count++;
+    }
+  }
+
+  if (rewritten)
+    forwarded.countSuggestedBindings = forwarded_count;
+
+  if (rewrite_count > 0)
+    log_message("Binding rewrite applied: %d of %u bindings.", rewrite_count,
+                suggestedBindings->countSuggestedBindings);
+
+  XrResult result = _xrSuggestInteractionProfileBindings(instance, &forwarded);
+  free(rewritten);
+  return result;
 }
 
 // xrSyncActions
@@ -1720,6 +2933,8 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSyncActions(
     const XrActionsSyncInfo *syncInfo)
 {
   log_message("xrSyncActions %d", rand() % 1000);
+  if (InterlockedExchange(&action_dump_requested, 0))
+    proxy_dump_action_table("gui_request");
   return _xrSyncActions(session, syncInfo);
 }
 

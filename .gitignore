@@ -1,1 +1,9 @@
 /obj
+obj/
+.vs/
+*.TMP
+*.exe
+*.bak
+*.backup
+*.log
+hooks_new.txt

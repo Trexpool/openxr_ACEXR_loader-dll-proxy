@@ -10,27 +10,27 @@ A proxy DLL for the Khronos openxr_loader.dll (OpenXR loader specification). It 
 
 Video description and demonstration: https://www.youtube.com/watch?v=WixaeDdFIWg
 
-**LICENSE STATUS**
+## **LICENSE STATUS**
 
 This project is not yet licensed for public redistribution, because the upstream code it is forked from is unlicensed: the upstream repository has no LICENSE file and no license statement. A request has been made to the upstream author about licensing, and is tracked in upstream issue #7. A pull request offering these improvements back upstream is planned but has not yet been opened. No license is granted by this repository.
 
 Source is published here for inspection and contribution. No compiled binaries are distributed.
 
-**Credits**
+## **Credits**
 
 - Upstream project: openxr_loader-dll-proxy by aruametello. This repository is a fork of that project.
 - This fork: Trexpool/openxr_ACEXR_loader-dll-proxy.
 - This project's own work: the shared trigger core (src/xr_core.c, src/xr_core.h), the OpenXR API layer (src/openxr_input_layer.c), the trigger processing and click synthesis, the popup GUI font and legibility improvements, the offline regression tests (tools/trigger_curve_test.c), the calibration analysis tool (tools/calib_analysis.c), and the documentation. See NOTICE.md for the file-by-file breakdown.
 - Khronos OpenXR SDK: github.com/KhronosGroup/OpenXR-SDK.
 
-**Requirements**
+## **Requirements**
 
 - A Windows PC with a PC OpenXR runtime (for example SteamVR, Oculus/Meta PC, or Windows Mixed Reality).
 - Standalone Quest titles are not supported. A PC OpenXR runtime is required.
 - Use either the proxy DLL or the OpenXR API-layer build, never both at once. Running both causes conflicting input and pose changes.
 - No runtime redistributable is required. The build links the C++ runtime statically.
 
-**Installation**
+## **Installation**
 
 The proxy works per game: it replaces that game's own OpenXR loader in the game's folder.
 
@@ -44,7 +44,7 @@ The proxy is per game. Each game that needs it gets its own folder, its own DLL,
 
 Anti-cheat caveat: some games with kernel-level anti-cheat will refuse to load an unsigned replacement DLL. Check a game's anti-cheat policy first, and use at your own risk.
 
-Verifying it loaded
+## **Verifying it loaded**
 
 Start the game once and quit. The proxy writes a log file in the game's working directory and prints the action table path at startup:
 
@@ -54,7 +54,7 @@ If you see that line in the log, the proxy loaded. The log and action_table.txt 
 
 The config file, by contrast, is read from the same folder as the DLL (the proxy locates its own module and looks there). The config and the original loader are expected beside the proxy.
 
-**Troubleshooting**
+## **Troubleshooting**
 
 Symptom	Likely cause
 No log file, no ACTION_TABLE line	The proxy did not load. Check that original_openxr_loader.dll sits beside the proxy in the same folder.
@@ -63,7 +63,7 @@ Invalid value found in the config file	A config key is misspelled, or a value is
 Trigger feels unchanged	Confirm trigger_click_threshold and trigger_curve_exponent are the values you think they are, then check the log's FIREPATH lines for the values actually being delivered.
 Trigger is dead or unresponsive	Set trigger_force_value=-1 and trigger_click_threshold=-1 to restore pass-through, then change one setting at a time.
 
-**Building**
+## **Building**
 
 The Makefile contains these targets:
 
@@ -72,7 +72,7 @@ The Makefile contains these targets:
 - input_layer: builds the OpenXR API-layer variant.
 - clean: removes build output.
 
-**Requirements:**
+### **Requirements:**
 
 1. Install MSYS2 and open the UCRT64 shell.
 2. Install the toolchain and make:
@@ -96,7 +96,7 @@ make dll_release OPENXR_INCLUDE="/ucrt64/include" OPENXR_LIB="/ucrt64/lib"
 
 The precompiled binaries were built with MSYS2 (UCRT64/MinGW-w64 GCC). Other GCC-compatible toolchains are likely to work.
 
-**Offline trigger core tests**
+### **Offline trigger core tests**
 
 These tests need no VR runtime:
 
@@ -105,13 +105,13 @@ trigger_curve_test.exe
 
 The last line reports OVERALL PASS (0 failure(s)) when every check passes.
 
-**Configuration**
+## **Configuration**
 
 Settings are read from openxr_loader_config.txt in the folder containing the DLL. Rotation values are in degrees, positions in metres. Use . as the decimal point. Lines starting with # are comments.
 
 Back up the config before editing it. If the parser encounters a key it does not recognize, it stops parsing and rewrites the whole file from its in-memory state, discarding the rest of your settings.
 
-**Pose offsets**
+### **Pose offsets**
 
 Key	Range / default	Meaning
 left_hand_rotation_offset_x	degrees, default 0	Left controller pitch offset (x = up/down).
@@ -131,14 +131,14 @@ capture_ads_apply_position	0 or 1, default 0	When 1, ADS capture also stores pos
 
 The shipped openxr_loader_config.txt contains example rotation values for both hands. They are a sample, not the built-in defaults.
 
-**Input and remapping**
+### **Input and remapping**
 
 Key	Range / default	Meaning
 binding_log	0-2, default 1	Binding log level. Out-of-range values reset to 1.
 remap_enabled	0 or 1, default 0	Enables action-binding remapping rules.
 profile_process	executable name, default readyornot-win64-shipping.exe	Process whose interaction profiles are remapped. The Steam build's executable has a different name (readyornotsteam-win64-shipping.exe), so set this to match the game you are running.
 
-**Trigger settings**
+### **Trigger settings**
 
 The analog pull (trigger/value) and the digital click (trigger/click, or the legacy boolean action) are separate signals controlled by different keys. Analog shaping keys change only the analog value. Click keys decide whether and how a synthesized click combines with the runtime click. Check which signal your game reads before tuning.
 
@@ -154,7 +154,7 @@ click_mode	replace, or, and; default replace	How a synthesized click combines wi
 click_compare	rawpull or curved; default rawpull	Value compared against trigger_click_threshold. rawpull uses the value after deadzone and range normalization, before exponent and gain. curved uses the value after exponent and gain.
 trigger_target_action	default empty	With two or more actions bound to trigger/value, applies shaping only to the named action.
 
-**Findings: Ready or Not VRO (tested)**
+## **Findings: Ready or Not VRO (tested)**
 
 These results were observed in Ready or Not with VRO.
 
@@ -167,11 +167,11 @@ These results were observed in Ready or Not with VRO.
 - trigger_range_max had no in-game effect: it was tested at 0.30, 0.10 and -1.10, and none of these values changed in-game behavior. The game appears to fire from the click boolean rather than the analog pull value, so range scaling does not affect firing in this title. The binary was confirmed to read the key, so the test was valid rather than a no-op.
 - Hand animation froze: when the trigger click boolean was overridden, the hand animation froze in a closed fist. Overriding a trigger boolean also overrides any game logic keyed to it. The left-hand trigger synthesis is therefore off by default.
 
-**Pose limitation**
+### **Pose limitation**
 
 The grip-to-aim transform and the physical mount rotation are only observable as their product. No runtime-only capture can separate them, so offsets are tuned as a combined result. A head-relative capture cannot recover a mount-relative correction.
 
-**Logging**
+## **Logging**
 
 - Every action-state query is logged by action name.
 - An ACTION name=... sources=[...] hands=[...] table is written at startup and can be dumped from the GUI. It is saved next to the log file, and its full path is logged as ACTION_TABLE path=....
@@ -181,7 +181,7 @@ The grip-to-aim transform and the physical mount rotation are only observable as
 - CONFIG trigger_range_max=... raw=... sanitized=... is logged at startup.
 - Logs rotate at a fixed size and a small number of backups are kept.
 
-**Known limitations**
+## **Known limitations**
 
 - The popup GUI uses fixed control positions and is not yet DPI-aware. It is a developer tool, not a polished settings window.
 - Pose correction and input shaping are separate problems. The tool cannot change a physical button layout.
@@ -189,7 +189,7 @@ The grip-to-aim transform and the physical mount rotation are only observable as
 - The grip-to-aim transform and the physical mount rotation are only observable as their product (see above).
 - The proxy and the API layer must not be active at the same time.
 
-**Repository layout**
+## **Repository layout**
 
 - src/main.c: legacy proxy configuration, logging, GUI integration, pose hooks and trigger setup.
 - src/openxr_input_layer.c: OpenXR API-layer implementation. Use one of the two builds at a time, not both.
